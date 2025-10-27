@@ -471,6 +471,10 @@ def process_workbook(uploaded_file, code_to_cat, infer_month=False, month_for_da
 # Generazione PDF
 # -----------------------
 def to_pdf_bytes(grouped_df, df_valid, month_string=""):
+    """
+    Genera un PDF semplice: per ogni categoria produce blocchi con le righe di df_valid.
+    Ritorna i bytes del PDF. Import reportlab localmente per non fallire all'import del modulo.
+    """
     try:
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, PageBreak
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -479,10 +483,11 @@ def to_pdf_bytes(grouped_df, df_valid, month_string=""):
         from reportlab.lib.units import mm
     except ModuleNotFoundError as e:
         raise ModuleNotFoundError(
-            "reportlab non è installato. Installa la dipendenza (es. pip install reportlab) "
+            "reportlab non è installato. Installa la dipendenza (pip install reportlab) "
             "o aggiungi 'reportlab' a requirements.txt e riavvia l'app."
         ) from e
 
+    from io import BytesIO
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=12 * mm, leftMargin=12 * mm, topMargin=12 * mm, bottomMargin=12 * mm)
     styles = getSampleStyleSheet()
@@ -491,7 +496,7 @@ def to_pdf_bytes(grouped_df, df_valid, month_string=""):
 
     story = []
 
-    if grouped_df.empty:
+    if grouped_df is None or grouped_df.empty:
         story.append(Paragraph("Nessuna dicitura di assenza trovata.", style_normal))
     else:
         categories = grouped_df["Category"].unique().tolist()
@@ -502,8 +507,8 @@ def to_pdf_bytes(grouped_df, df_valid, month_string=""):
             story.append(Paragraph(header, style_cat))
             story.append(Spacer(1, 4))
 
-            df_cat = df_valid[df_valid["Category"] == cat].copy()
-            if df_cat.empty:
+            df_cat = df_valid[df_valid["Category"] == cat] if df_valid is not None else None
+            if df_cat is None or df_cat.empty:
                 story.append(Paragraph("Nessun elemento per questa categoria.", style_normal))
                 if idx_cat != len(categories) - 1:
                     story.append(PageBreak())
