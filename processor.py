@@ -1,3 +1,16 @@
+# processor.py
+"""
+Processor completo e pulito per 'controlli_fine_mese'.
+
+Funzionalità:
+- load_codes_map: legge codes.csv (path o file-like), supporta separatori ',' o ';' nei codici.
+- read_input_table: reader flessibile per .txt/.csv/.tsv/.xls/.xlsx/HTML (prova TSV/tab con cp1252 prima).
+- normalize_df_with_headers / normalize_df_no_header
+- extract_turno_tokens / map_tokens_to_category
+- build_date_representation / infer_month_string_from_dates
+- process_workbook: estrae righe con categorie riconosciute, ordina e aggrega.
+- to_pdf_bytes: genera PDF (import reportlab all'interno della funzione).
+"""
 import re
 import csv
 from io import BytesIO, StringIO
@@ -286,7 +299,6 @@ def normalize_df_no_header(df):
     else:
         df['Turno_raw'] = ""
         df['Turno_tokens'] = [[] for _ in range(len(df))]
-
     return df
 
 
