@@ -17,6 +17,16 @@ import pandas as pd
 
 
 def load_codes_map(codes_csv_path):
+    """
+    Legge codes.csv (path o file-like) e costruisce mapping codice->categoria.
+    Supporta codici separati da virgola o punto-e-virgola (es. "MA,MA3" o "MA;MA3").
+    Ritorna (code_to_cat, categories_order).
+    """
+    import pandas as pd
+    from io import StringIO
+    from pathlib import Path
+
+    # read CSV (path or file-like)
     try:
         if not isinstance(codes_csv_path, (str, Path)):
             try:
@@ -37,12 +47,15 @@ def load_codes_map(codes_csv_path):
     code_to_cat = {}
     categories_order = []
     for _, row in df.iterrows():
-        cat = row.get("Category", "").strip()
-        codes = row.get("Codes", "")
+        cat = str(row.get("Category", "")).strip()
+        codes_field = str(row.get("Codes", "")).strip()
         if cat:
             categories_order.append(cat)
-        for code in [c.strip() for c in str(codes).split(",") if c.strip()]:
-            code_to_cat[code] = cat
+        # split su virgola o punto e virgola (accetta anche spazi)
+        if codes_field:
+            parts = [p.strip() for p in re.split(r'[;,]+', codes_field) if p.strip()]
+            for code in parts:
+                code_to_cat[code] = cat
     return code_to_cat, categories_order
 
 
