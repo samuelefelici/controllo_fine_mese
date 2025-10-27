@@ -384,47 +384,35 @@ def infer_month_string_from_dates(df):
 # Main processing
 # -----------------------
 def process_workbook(uploaded_file, code_to_cat, infer_month=False, month_for_days=None, year_for_days=None):
+    """
+    Esegue tutto il flusso:
+    - legge il file (read_input_table)
+    - normalizza colonne
+    - costruisce Data_repr/Data_parsed
+    - estrae token e mappa categorie tramite code_to_cat
+    - filtra righe riconosciute e ordina
+    Ritorna: (grouped_df, df_valid, month_string)
+    """
     raw_df, had_header = read_input_table(uploaded_file)
-    # --- DEBUG: info diagnostiche temporanee (rimuovere dopo il debug) ---
-import sys
-print("DEBUG: Entering process_workbook", file=sys.stderr)
-print("DEBUG: had_header =", had_header, file=sys.stderr)
-try:
-    print("DEBUG: raw_df.shape =", getattr(raw_df, "shape", None), file=sys.stderr)
-    cols = list(raw_df.columns)
-    print("DEBUG: raw_df.columns (first 50) =", cols[:50], file=sys.stderr)
-    # duplicate column names
-    from collections import Counter
-    dup = [c for c, n in Counter(cols).items() if n > 1]
-    print("DEBUG: duplicate columns =", dup, file=sys.stderr)
-    # sample types and heads for suspicious cols
-    for c in ["Turno_raw", "Turno_tokens", "Mat", "Data_raw", "Turno", "TurnoC", "TurnoE"]:
-        if c in raw_df.columns:
-            val = raw_df[c].head(10)
-            print(f"DEBUG sample column {c}: type={type(raw_df[c])} head=\\n{val.to_string(index=False)}", file=sys.stderr)
-        else:
-            print(f"DEBUG column {c} NOT present", file=sys.stderr)
-except Exception as e:
-    print("DEBUG: error while collecting diagnostics:", repr(e), file=sys.stderr)
-# Verifica lunghezze quando costruirai liste; es. se usi list comprehension su raw_df['Turno_raw']:
-try:
-    tr = _ensure_series(raw_df, "Turno_raw").astype(str).fillna("")
-    tokens_list = [extract_turno_tokens(x) for x in tr]
-    print("DEBUG: len(tr)=", len(tr), "len(tokens_list)=", len(tokens_list), file=sys.stderr)
-    # mostra primi 5 token_list
-    print("DEBUG: tokens_list[0:5] =", tokens_list[0:5], file=sys.stderr)
-except Exception as e:
-    print("DEBUG: error building tokens_list:", repr(e), file=sys.stderr)
-# --- END DEBUG ---
+
+    # ---------- se vuoi fare debug temporaneo, inserisci stampe INDENTATE qui sotto ----------
+    # esempio di debug (rimuovi/commmenta dopo l'uso)
+    # import sys
+    # print("DEBUG: had_header =", had_header, file=sys.stderr)
+    # print("DEBUG: raw_df.shape =", getattr(raw_df, "shape", None), file=sys.stderr)
+    # ---------------------------------------------------------------------------------------
+
+    # normalizzazione
     if had_header:
         df = normalize_df_with_headers(raw_df)
     else:
         df = normalize_df_no_header(raw_df)
 
-    # Data_repr / Data_parsed
+    # Data_repr e Data_parsed
     if "Data_raw" in df.columns:
         df["Data_repr"] = df["Data_raw"].apply(lambda v: build_date_representation(v, month_for_days, year_for_days))
         df["Data_parsed"] = pd.to_datetime(df["Data_raw"], dayfirst=True, errors="coerce")
+        # se month/year forniti proviamo a costruire Data_parsed quando non parseable
         if month_for_days is not None and year_for_days is not None:
             def maybe_build_parsed(v):
                 try:
@@ -440,34 +428,40 @@ except Exception as e:
         df["Data_repr"] = ""
         df["Data_parsed"] = pd.NaT
 
-    # mapping tokens -> Category
+    # mapping token -> category
     def map_row_tokens(tokens):
         code, cat = map_tokens_to_category(tokens, code_to_cat)
         return pd.Series({"MatchedCode": code, "Category": cat})
 
     if "Turno_tokens" in df.columns:
         mapped = df["Turno_tokens"].apply(lambda toks: map_row_tokens(toks))
-        df = pd.concat([df, mapped], axis=1)
+        # mapped è una DataFrame con 2 colonne; concateniamo correttamente
+        df = pd.concat([df.reset_index(drop=True), mapped.reset_index(drop=True)], axis=1)
     else:
         df["MatchedCode"] = None
         df["Category"] = None
 
+    # filtra righe con categoria nota
     df_valid = df[df["Category"].notnull()].copy()
     if df_valid.empty:
         grouped = pd.DataFrame(columns=["Category", "Mat", "Cognome", "Nome", "Qualifica", "Dates", "DaysCount", "RawTurns"])
         return grouped, df_valid, None
 
+    # Nr per riga
     df_valid["Nr"] = 1
+
+    # ordinamento: Category -> Mat (numeric se possibile) -> Data_parsed -> Data_repr
     def try_int(x):
         try:
             return int(x)
         except Exception:
             return x
+
     df_valid["Mat_sort_key"] = _ensure_series(df_valid, "Mat").apply(try_int)
     df_valid["Data_sort_key"] = df_valid["Data_parsed"].fillna(pd.NaT)
     df_valid = df_valid.sort_values(by=["Category", "Mat_sort_key", "Data_sort_key", "Data_repr"])
 
-    # grouped
+    # aggregazione di supporto
     def dates_agg(x):
         vals = [v for v in x.dropna().tolist() if str(v).strip() != ""]
         seen = []
@@ -490,6 +484,7 @@ except Exception as e:
     if infer_month:
         month_string = infer_month_string_from_dates(df_valid)
 
+    # pulizia chiavi temporanee
     if "Mat_sort_key" in grouped.columns:
         grouped = grouped.drop(columns=["Mat_sort_key"])
     if "Mat_sort_key" in df_valid.columns:
