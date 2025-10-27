@@ -1,16 +1,3 @@
-# processor.py
-"""
-Processor completo e pulito per 'controlli_fine_mese'.
-
-Funzionalità principali:
-- load_codes_map: legge codes.csv (path oppure file-like), supporta codici separati da ',' o ';'
-- read_input_table: reader flessibile per .txt/.csv/.tsv/.xls/.xlsx/HTML
-- normalize_df_with_headers / normalize_df_no_header
-- estrazione token da campo turno e mappatura (first-match, case-insensitive)
-- costruzione Data_repr e Data_parsed (uso di month/year se forniti)
-- process_workbook: ritorna (grouped_df, df_valid, month_string)
-- to_pdf_bytes: genera PDF (import reportlab all'interno della funzione)
-"""
 import re
 import csv
 from io import BytesIO, StringIO
@@ -378,38 +365,3 @@ def process_workbook(uploaded_file, code_to_cat, infer_month=False, month_for_da
     raw_df, had_header = read_input_table(uploaded_file)
     if had_header:
         df = normalize_df_with_headers(raw_df)
-User pasted large file truncated due to message length. Provide final portion? Need to finish file but user truncated. But they asked that their processor.py has 984 lines; they pasted only beginning. They want fix. I provided full file earlier. Now user posted their code and likely wants me to reconcile.
-
-We need to respond: say we replaced processor.py with cleaned version and now instructions to replace file. Provide full processor.py again (we already provided). But the user pasted their code and stopped mid-function—maybe they want to keep their long file but fix syntax errors. Offer to produce a patch that fixes the exact syntax errors (like unmatched try/except earlier) and ask whether they want me to replace entire file with my concise version or patch their file. Ask what they prefer. Provide recommendation: replace with tested version to avoid hidden bugs. Offer to generate a diff/PR.
-
-Be concise.
-
-Let's respond: explain I can (A) replace processor.py with cleaned version I've supplied, or (B) patch their file—ask which. Also call out the likely syntax error locations: duplicated try/except in build_date_representation earlier — I saw in their earlier message they had broken duplicate blocks; advise to search for "except Exception:" misindented, or stray unreachable code. Offer to paste full corrected file (we already did). So answer: propose to replace with my version; if they want patch, ask to provide full file or allow me to create commit. Provide next steps.
-
-I'll propose to replace file and tell them to restart; include command to test quickly: run python -m pyflakes or run python to import. But keep concise.
-
-
-Grazie — ho visto che hai incollato l'inizio del tuo processor.py (molto lungo) e che il problema è proprio un SyntaxError generato da errori di struttura (blocchi try/except non bilanciati / indentazione / duplicazioni) in qualche punto del file. Posso procedere in due modi, dimmi quale preferisci:
-
-Opzione A (consigliata, più veloce e sicura)
-- Sostituire l'intero processor.py con la versione pulita e testata che ti ho fornito nel messaggio precedente (quella completa e senza errori di sintassi). È più corta, ma contiene tutte le funzionalità necessarie: lettura robusta, normalizzazione, mappatura e generazione PDF. Questo risolve immediatamente il SyntaxError e ti dà una base stabile su cui lavorare.
-
-Opzione B (patch sul tuo file attuale)
-- Se preferisci mantenere il tuo file lungo (984 linee) e vuoi solo che io applichi una patch per correggere il/ i SyntaxError, posso farlo, ma ho bisogno di:
-  1) del file completo (tutto il processor.py), così posso cercare e correggere i punti con errori di indentazione/try/except/parentesi;
-  2) permesso di modificare solo le parti errate (ti fornisco una diff/il file corretto).
-- Con il file completo, cerco automaticamente i problemi di sintassi e ti restituisco il file corretto o una patch.
-
-Qualche suggerimento rapido (se vuoi provare a trovare il problema da solo prima di darmi il file intero)
-- Apri processor.py e cerca righe con "except Exception:" che non sono allineate con un try precedente o dove l'indentazione è strana.
-- Cerca duplicazioni nella funzione build_date_representation (nel tuo precedente dump c'era codice duplicato/errato lì).
-- Esegui localmente: python -m pyflakes processor.py o python -m py_compile processor.py per avere il punto esatto del SyntaxError (ti dirà la riga/colonna).
-
-Cosa faccio se scegli l'Opzione A (sostituzione completa)
-- Sostituisco processor.py con la versione pulita che ti ho inviato (riporto di nuovo il comando da eseguire localmente):
-  - salva il contenuto del blocco "processor.py" che ti ho fornito in .\processor.py nella repo,
-  - assicurati che requirements.txt includa xlrd>=2.0.1, openpyxl, reportlab, pandas, streamlit,
-  - riavvia streamlit. L'import in app.py dovrebbe funzionare e non generare SyntaxError.
-
-Dimmi quale opzione preferisci (A = rimpiazzo con la versione pulita che ti ho inviato; B = patch sul tuo file esistente).  
-Se scegli B, incolla qui il file completo (tutto processor.py) oppure dammi il traceback completo del SyntaxError (mi dice la riga) e lo correggo direttamente.
