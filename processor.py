@@ -385,6 +385,37 @@ def infer_month_string_from_dates(df):
 # -----------------------
 def process_workbook(uploaded_file, code_to_cat, infer_month=False, month_for_days=None, year_for_days=None):
     raw_df, had_header = read_input_table(uploaded_file)
+    # --- DEBUG: info diagnostiche temporanee (rimuovere dopo il debug) ---
+import sys
+print("DEBUG: Entering process_workbook", file=sys.stderr)
+print("DEBUG: had_header =", had_header, file=sys.stderr)
+try:
+    print("DEBUG: raw_df.shape =", getattr(raw_df, "shape", None), file=sys.stderr)
+    cols = list(raw_df.columns)
+    print("DEBUG: raw_df.columns (first 50) =", cols[:50], file=sys.stderr)
+    # duplicate column names
+    from collections import Counter
+    dup = [c for c, n in Counter(cols).items() if n > 1]
+    print("DEBUG: duplicate columns =", dup, file=sys.stderr)
+    # sample types and heads for suspicious cols
+    for c in ["Turno_raw", "Turno_tokens", "Mat", "Data_raw", "Turno", "TurnoC", "TurnoE"]:
+        if c in raw_df.columns:
+            val = raw_df[c].head(10)
+            print(f"DEBUG sample column {c}: type={type(raw_df[c])} head=\\n{val.to_string(index=False)}", file=sys.stderr)
+        else:
+            print(f"DEBUG column {c} NOT present", file=sys.stderr)
+except Exception as e:
+    print("DEBUG: error while collecting diagnostics:", repr(e), file=sys.stderr)
+# Verifica lunghezze quando costruirai liste; es. se usi list comprehension su raw_df['Turno_raw']:
+try:
+    tr = _ensure_series(raw_df, "Turno_raw").astype(str).fillna("")
+    tokens_list = [extract_turno_tokens(x) for x in tr]
+    print("DEBUG: len(tr)=", len(tr), "len(tokens_list)=", len(tokens_list), file=sys.stderr)
+    # mostra primi 5 token_list
+    print("DEBUG: tokens_list[0:5] =", tokens_list[0:5], file=sys.stderr)
+except Exception as e:
+    print("DEBUG: error building tokens_list:", repr(e), file=sys.stderr)
+# --- END DEBUG ---
     if had_header:
         df = normalize_df_with_headers(raw_df)
     else:
