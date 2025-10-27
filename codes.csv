@@ -1,13 +1,13 @@
 Category,Codes
-Ferie,F,FU,FP,F1/2
-Malattie,MA,MA3,MA20
-Infortuni,I,I4,I91
+Ferie,F;FU;FP;F1/2
+Malattie,MA;MA3;MA20
+Infortuni,I;I4;I91
 Noleggio,N
 Straordinari,STRA
 Trasferte,KM
-Permessi Sindacali,PS,PS30,PSm2,PSm3,PSn,P626
-Permessi Amministrativi,PC,PE,ES,PPR,PAL,PD,FB,AGP,AS
-Riposi,R,RR,RSPO
-Assenze Arbitrarie,AA,PN
-Turni,M132,M161
-Permessi Vari,AF,AO,AP,PADm,CM,CM8,PA,PAD,PP,SC
+Permessi Sindacali,PS;PS30;PSm2;PSm3;PSn;P626
+Permessi Amministrativi,PC;PE;ES;PPR;PAL;PD;FB;AGP;AS
+Riposi,R;RR;RSPO
+Assenze Arbitrarie,AA;PN
+Turni,M132;M161
+Permessi Vari,AF;AO;AP;PADm;CM;CM8;PA;PAD;PP;SC
