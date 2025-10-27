@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 from pathlib import Path
 from processor import process_workbook, to_pdf_bytes, load_codes_map
