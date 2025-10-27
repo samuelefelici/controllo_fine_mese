@@ -1,5 +1,5 @@
 streamlit
 pandas
-xlrd==1.2.0
+xlrd>=2.0.1
 openpyxl
 reportlab>=3.6.0
