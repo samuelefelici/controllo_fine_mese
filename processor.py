@@ -271,13 +271,18 @@ def normalize_df_with_headers(df):
             col_map[c] = c
     df = df.rename(columns=col_map)
 
+    # garantiamo che Mat e Turno_raw siano Series pulite (evita ritorni DataFrame)
     df["Mat"] = _ensure_series(df, "Mat").astype(str).str.strip()
     df["Turno_raw"] = _ensure_series(df, "Turno_raw").astype(str).fillna("").str.strip()
-    df["Turno_tokens"] = df["Turno_raw"].apply(extract_turno_tokens)
 
+    # costruzione Turno_tokens con list comprehension (robusta contro RHS DataFrame)
+    df["Turno_tokens"] = [extract_turno_tokens(x) for x in df["Turno_raw"].astype(str).fillna("")]
+
+    # assicuriamo le altre colonne come Series stringa
     for col in ("Cognome", "Nome", "Qualifica", "Data_raw", "Giorno", "Minuti"):
         df[col] = _ensure_series(df, col).astype(str).fillna("")
 
+    return df
     return df
 
 
