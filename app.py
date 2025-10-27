@@ -10,8 +10,8 @@ repo_root = Path(__file__).parent
 codes_file = repo_root / "codes.csv"
 
 st.markdown(
-    "Questa app estrae le diciture di assenza dai file .xls usando `codes.csv` per la mappatura. "
-    "Non viene effettuata nessuna verifica o correzione automatica dei dati: il programma riporta ciò che trova."
+    "Questa app estrae le diciture di assenza dai file Excel (.xls/.xlsx) o testo (.csv/.txt). "
+    "Non vengono fatte verifiche sui dati: il programma riporta ciò che trova."
 )
 
 # Sidebar opzioni
@@ -25,7 +25,7 @@ st.sidebar.subheader("Mese/Anno (usati se 'Data' è solo giorno)")
 month_input = st.sidebar.selectbox("Mese", [""] + ["Gennaio","Febbraio","Marzo","Aprile","Maggio","Giugno","Luglio","Agosto","Settembre","Ottobre","Novembre","Dicembre"])
 year_input = st.sidebar.text_input("Anno (es. 2025)", value="")
 
-# Se codes.csv non esiste nella repo, permetti di caricarlo dalla sidebar
+# codes.csv: se non presente permetti caricamento
 uploaded_codes_file = None
 if codes_file.exists():
     try:
@@ -54,7 +54,7 @@ if month_input:
     months_it = { "Gennaio":1,"Febbraio":2,"Marzo":3,"Aprile":4,"Maggio":5,"Giugno":6,"Luglio":7,"Agosto":8,"Settembre":9,"Ottobre":10,"Novembre":11,"Dicembre":12 }
     month_num = months_it.get(month_input)
 
-uploaded_file = st.file_uploader("Carica il file .xls con intestazione o senza", type=["xls"], accept_multiple_files=False)
+uploaded_file = st.file_uploader("Carica il file (.xls, .xlsx, .csv, .txt)", type=["xls","xlsx","csv","txt"], accept_multiple_files=False)
 if uploaded_file is None:
     st.stop()
 
