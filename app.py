@@ -9,24 +9,17 @@ st.title("Controlli Fine Mese - Estrazione diciture di assenza (PDF)")
 repo_root = Path(__file__).parent
 codes_file = repo_root / "codes.csv"
 
-st.markdown(
-    "Questa app estrae le diciture di assenza dai file Excel (.xls/.xlsx) o testo (.csv/.txt). "
-    "Non vengono fatte verifiche sui dati: il programma riporta ciò che trova."
-)
+st.markdown("Carica il file (.xls/.xlsx/.csv/.txt). L'app estrae le diciture e genera un PDF ordinato per categoria -> matricola -> data.")
 
-# Sidebar opzioni
+# Sidebar
 st.sidebar.header("Opzioni")
-st.sidebar.markdown(f"File di mappatura codici: `{codes_file.name}` (modificabile nella repo)")
+st.sidebar.markdown(f"File di mappatura codici: `{codes_file.name}`")
 show_raw = st.sidebar.checkbox("Mostra dati grezzi", value=False)
 infer_month = st.sidebar.checkbox("Usa mese/anno forniti se 'Data' è solo giorno", value=True)
-
-# Mese/Anno per comporre date quando Data è solo giorno (opzionale)
-st.sidebar.subheader("Mese/Anno (usati se 'Data' è solo giorno)")
 month_input = st.sidebar.selectbox("Mese", [""] + ["Gennaio","Febbraio","Marzo","Aprile","Maggio","Giugno","Luglio","Agosto","Settembre","Ottobre","Novembre","Dicembre"])
 year_input = st.sidebar.text_input("Anno (es. 2025)", value="")
 
-# codes.csv: se non presente permetti caricamento
-uploaded_codes_file = None
+# load codes
 if codes_file.exists():
     try:
         codes_map, categories_order = load_codes_map(codes_file)
@@ -34,33 +27,33 @@ if codes_file.exists():
         st.error(f"Errore caricamento {codes_file.name}: {e}")
         codes_map, categories_order = {}, []
 else:
-    st.sidebar.warning(f"{codes_file.name} non trovato nella repository. Puoi caricarlo qui sotto oppure aggiungerlo alla repo.")
-    uploaded_codes_file = st.sidebar.file_uploader("Carica codes.csv (opzionale)", type=["csv"])
-    if uploaded_codes_file is not None:
+    st.sidebar.warning(f"{codes_file.name} non trovato nella repo. Caricalo qui o aggiungilo alla repo.")
+    uploaded_codes = st.sidebar.file_uploader("Carica codes.csv (opzionale)", type=["csv"])
+    if uploaded_codes:
         try:
-            codes_map, categories_order = load_codes_map(uploaded_codes_file)
+            codes_map, categories_order = load_codes_map(uploaded_codes)
         except Exception as e:
             st.error(f"Errore caricamento file caricato: {e}")
             codes_map, categories_order = {}, []
     else:
         codes_map, categories_order = {}, []
 
-st.sidebar.subheader("Categorie trovate")
-st.sidebar.write(", ".join(categories_order) if categories_order else "Nessuna (mappa vuota)")
+st.sidebar.subheader("Categorie caricate")
+st.sidebar.write(", ".join(categories_order) if categories_order else "Nessuna")
 
-# convert month_input -> numeric month or None
+# month numeric
 month_num = None
 if month_input:
     months_it = { "Gennaio":1,"Febbraio":2,"Marzo":3,"Aprile":4,"Maggio":5,"Giugno":6,"Luglio":7,"Agosto":8,"Settembre":9,"Ottobre":10,"Novembre":11,"Dicembre":12 }
     month_num = months_it.get(month_input)
 
-uploaded_file = st.file_uploader("Carica il file (.xls, .xlsx, .csv, .txt)", type=["xls","xlsx","csv","txt"], accept_multiple_files=False)
+uploaded_file = st.file_uploader("Carica il file (.xls/.xlsx/.csv/.txt)", type=["xls","xlsx","csv","txt"], accept_multiple_files=False)
 if uploaded_file is None:
     st.stop()
 
 with st.spinner("Elaborazione file..."):
     try:
-        grouped_df, raw_df, inferred_month_str = process_workbook(
+        grouped_df, df_valid, inferred_month_str = process_workbook(
             uploaded_file,
             codes_map,
             infer_month=infer_month,
@@ -71,20 +64,19 @@ with st.spinner("Elaborazione file..."):
         st.error(f"Errore durante l'elaborazione: {e}")
         st.stop()
 
-st.subheader("Riepilogo estratto per categoria / matricola")
-st.write("Colonne: Category, Mat, Cognome, Nome, Dates, DaysCount, RawTurns")
+st.subheader("Anteprima riepilogo (aggregato)")
 st.dataframe(grouped_df)
 
 if show_raw:
-    st.subheader("Dati grezzi normalizzati (anteprima)")
-    st.dataframe(raw_df.head(200))
+    st.subheader("Dati validi (righe filtrate, anteprima)")
+    st.dataframe(df_valid.head(200))
 
 month_string = inferred_month_str or (f"{month_input} {year_input}" if month_input and year_input else "Mese non specificato")
 st.markdown(f"**Mese di riferimento**: {month_string}")
 
-# Genera PDF e download
+# Genera PDF
 try:
-    pdf_bytes = to_pdf_bytes(grouped_df, month_string)
+    pdf_bytes = to_pdf_bytes(grouped_df, df_valid, month_string)
     st.download_button("Scarica PDF resoconto", data=pdf_bytes, file_name=f"resoconto_assenze_{month_string.replace(' ','_')}.pdf", mime="application/pdf")
 except ModuleNotFoundError as e:
     st.error(str(e))
