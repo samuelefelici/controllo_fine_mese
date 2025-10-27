@@ -1,14 +1,13 @@
 """
-processor.py - versione completa e autonoma, pronta da incollare.
+processor.py - versione completa e robusta
 
-Scopo: leggere il file di input (.xls/.xlsx/.csv/.txt), estrarre le
-diciture di assenza usando codes.csv, aggregare e generare PDF.
-
-Nota:
-- Mantengo il codice semplice e leggibile (commenti in italiano).
-- Assicurati che requirements.txt contenga almeno: pandas, xlrd>=2.0.1, openpyxl, reportlab.
+Correzioni importanti:
+- gestione robusta dei casi in cui df[col] ritorni un DataFrame (colonne duplicate).
+- helper _ensure_series per garantire sempre una pandas.Series prima di usare .str o .apply.
+- reader, normalizzazione, mappatura e generazione PDF inclusi.
 """
 import re
+import csv
 from io import BytesIO, StringIO
 from datetime import datetime
 from pathlib import Path
@@ -17,13 +16,38 @@ import pandas as pd
 
 
 # -----------------------
+# Helper robusti
+# -----------------------
+def _ensure_series(df, col):
+    """
+    Garantisce che df[col] ritorni una pandas.Series.
+    - Se la colonna non esiste -> ritorna Series vuota con indice del df.
+    - Se df[col] è DataFrame (colonne duplicate), prende la prima colonna che contiene dati,
+      altrimenti la prima colonna.
+    """
+    if col not in df.columns:
+        return pd.Series([""] * len(df), index=df.index)
+    s = df[col]
+    # Se una selezione ritorna DataFrame (es. colonne duplicate), scegli la prima colonna sensata
+    if isinstance(s, pd.DataFrame):
+        # preferisci la prima colonna che non è tutta NaN/empty
+        for c in s.columns:
+            ser = s[c]
+            try:
+                if ser.notna().any():
+                    return ser
+            except Exception:
+                pass
+        # fallback: ritorna la prima colonna
+        return s.iloc[:, 0]
+    # normal case: è già Series
+    return s
+
+
+# -----------------------
 # Load codes map
 # -----------------------
 def load_codes_map(codes_csv_path):
-    """
-    Legge codes.csv (path o file-like) e restituisce (code_to_cat, categories_order).
-    Accetta codici separati da ',' o ';' nella colonna Codes.
-    """
     try:
         if not isinstance(codes_csv_path, (str, Path)):
             # file-like (Streamlit UploadedFile)
@@ -52,24 +76,65 @@ def load_codes_map(codes_csv_path):
         if codes_field:
             parts = [p.strip() for p in re.split(r"[;,]+", codes_field) if p.strip()]
             for code in parts:
-                code_to_cat[code.upper()] = cat  # salvo in uppercase per confronto case-insensitive
+                code_to_cat[code.upper()] = cat
     return code_to_cat, categories_order
 
 
 # -----------------------
-# Reader semplice e robusto per file comuni
+# Reader flessibile
 # -----------------------
-def read_input_table(uploaded_file):
-    """
-    Legge il file caricato (Streamlit UploadedFile o path) e prova:
-      - Excel (.xls -> xlrd, .xlsx -> openpyxl)
-      - testo (.txt/.csv) preferendo tab ('\t') con encoding cp1252, poi altri delimitatori
-    Ritorna: (df, had_header: bool)
-    """
-    name = getattr(uploaded_file, "name", None)
-    ext = Path(name).suffix.lower() if name else ""
+def _try_read_excel_bytes(raw_bytes, engine):
+    try:
+        return pd.read_excel(BytesIO(raw_bytes), header=0, engine=engine)
+    except Exception:
+        return None
 
-    # leggi tutti i bytes (se file-like)
+
+def _detect_encoding_and_try_csv_preferring_tab(raw_bytes):
+    encodings = ["cp1252", "utf-8", "latin-1", "cp1250", "iso-8859-1"]
+    delimiters = ["\t", ";", ",", "|"]
+    for enc in encodings:
+        try:
+            text = raw_bytes.decode(enc)
+        except Exception:
+            continue
+        sample = text[:8192]
+        try:
+            sniffer = csv.Sniffer()
+            dialect = sniffer.sniff(sample)
+            delim = dialect.delimiter
+            has_header = sniffer.has_header(sample)
+            df = pd.read_csv(StringIO(text), sep=delim, header=0 if has_header else None, engine="python")
+            if df.shape[1] > 1:
+                return df, enc, delim, bool(has_header)
+        except Exception:
+            # try tab forced
+            try:
+                df = pd.read_csv(StringIO(text), sep="\t", header=0, engine="python", encoding=enc)
+                if df.shape[1] > 1:
+                    return df, enc, "\t", True
+            except Exception:
+                pass
+            for d in delimiters:
+                try:
+                    df = pd.read_csv(StringIO(text), sep=d, header=0, engine="python", encoding=enc)
+                    if df.shape[1] > 1:
+                        return df, enc, d, True
+                except Exception:
+                    continue
+    # whitespace fallback
+    for enc in encodings:
+        try:
+            text = raw_bytes.decode(enc)
+            df = pd.read_csv(StringIO(text), sep=r"\s+", header=0, engine="python")
+            if df.shape[1] > 1:
+                return df, enc, r"\s+", True
+        except Exception:
+            continue
+    return None, None, None, None
+
+
+def _read_flexible_excel_or_text(uploaded_file, header=0, prefer_header_detection=True):
     if hasattr(uploaded_file, "read"):
         raw = uploaded_file.read()
         try:
@@ -79,163 +144,161 @@ def read_input_table(uploaded_file):
     else:
         raw = Path(uploaded_file).read_bytes()
 
-    # Helper: try excel engines
-    def try_excel(engine):
-        try:
-            return pd.read_excel(BytesIO(raw), header=0, engine=engine)
-        except Exception:
-            return None
+    filename = getattr(uploaded_file, "name", None)
+    ext = Path(filename).suffix.lower() if filename else ""
 
-    # se estensione suggerisce excel
-    if ext == ".xlsx":
-        df = try_excel("openpyxl")
-        if df is not None:
-            return df, True
-    if ext == ".xls":
-        df = try_excel("xlrd")
-        if df is not None:
-            return df, True
+    # xlsx zip
+    try:
+        import zipfile
+        if zipfile.is_zipfile(BytesIO(raw)):
+            df = _try_read_excel_bytes(raw, engine="openpyxl")
+            if df is not None:
+                return df, True
+    except Exception:
+        pass
 
-    # se estensione è testo (.txt/.csv) o fallback: proviamo parsing testo
-    def try_text_parsing():
-        encodings = ["cp1252", "utf-8", "latin-1"]
-        delimiters = ["\t", ";", ",", "|"]
-        for enc in encodings:
-            try:
-                text = raw.decode(enc)
-            except Exception:
-                continue
-            # prima proviamo tab (molto comune per i file esportati)
-            try:
-                df = pd.read_csv(StringIO(text), sep="\t", header=0, engine="python")
-                if df.shape[1] > 1:
-                    return df, True
-            except Exception:
-                pass
-            # poi altri delimitatori
-            for d in delimiters:
-                try:
-                    df = pd.read_csv(StringIO(text), sep=d, header=0, engine="python")
-                    if df.shape[1] > 1:
-                        return df, True
-                except Exception:
-                    continue
-        # ultima prova: lascia che pandas cerchi di interpretare (sembra testo senza header)
-        for enc in encodings:
-            try:
-                text = raw.decode(enc)
-            except Exception:
-                continue
-            try:
-                df = pd.read_csv(StringIO(text), sep=None, engine="python")
-                if df.shape[1] > 1:
-                    return df, True
-            except Exception:
-                continue
-        return None, None
-
+    # prefer text parsing for txt/csv
     if ext in (".txt", ".csv"):
-        parsed, had_header = try_text_parsing()
-        if parsed is not None:
-            return parsed, had_header
+        df, enc, delim, has_header = _detect_encoding_and_try_csv_preferring_tab(raw)
+        if df is not None:
+            return df, True if has_header else False
 
-    # fallback generico: proviamo excel engines (in caso l'estensione fosse errata)
-    for engine in ("openpyxl", "xlrd"):
-        df = try_excel(engine)
+    # try excel engines
+    if ext == ".xls":
+        df = _try_read_excel_bytes(raw, engine="xlrd")
+        if df is not None:
+            return df, True
+    if ext == ".xlsx":
+        df = _try_read_excel_bytes(raw, engine="openpyxl")
         if df is not None:
             return df, True
 
-    # finalmente, tentativo testo generico
-    parsed, had_header = try_text_parsing()
-    if parsed is not None:
-        return parsed, had_header
+    for engine in ("openpyxl", "xlrd"):
+        try:
+            df = _try_read_excel_bytes(raw, engine=engine)
+            if df is not None:
+                return df, True
+        except Exception:
+            continue
 
-    raise RuntimeError("Impossibile leggere il file: formato non riconosciuto.")
+    # general text attempt (in case .xls is actually a TSV)
+    df, enc, delim, has_header = _detect_encoding_and_try_csv_preferring_tab(raw)
+    if df is not None:
+        return df, True if has_header else False
+
+    # html fallback
+    try:
+        text = None
+        for enc in ("utf-8", "cp1252", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except Exception:
+                continue
+        if text and ("<table" in text.lower() or "<html" in text.lower()):
+            tables = pd.read_html(StringIO(text))
+            if tables:
+                return tables[0], True
+    except Exception:
+        pass
+
+    raise RuntimeError("Tentativi di lettura falliti: file non riconosciuto come Excel/CSV/HTML.")
+
+
+def _read_xls_try_header(uploaded_file):
+    df, had_header = _read_flexible_excel_or_text(uploaded_file, header=0)
+    return df
+
+
+def _read_xls_no_header(uploaded_file):
+    df, had_header = _read_flexible_excel_or_text(uploaded_file, header=None)
+    if df is None:
+        raise RuntimeError("Impossibile leggere il file.")
+    if df.shape[1] >= 8 and list(df.columns)[:8] == list(range(8)):
+        df = df.iloc[:, :8]
+        df.columns = ["Mat", "Cognome", "Nome", "Qualifica", "Data_raw", "Giorno", "Turno_raw", "Minuti"]
+    return df
+
+
+def _has_expected_header_columns(df):
+    cols = [str(c).strip().lower() for c in df.columns]
+    has_mat = any("matric" in c or c == "mat" for c in cols)
+    has_cognome = any("cognome" in c for c in cols)
+    has_nome = any("nome" in c for c in cols)
+    has_data = any("data" in c for c in cols)
+    has_turno = any("turno" in c for c in cols)
+    return (has_mat and has_cognome and has_nome and has_turno) or (has_mat and has_cognome and has_nome and has_data)
+
+
+def read_input_table(uploaded_file):
+    try:
+        df_head = _read_xls_try_header(uploaded_file)
+        if _has_expected_header_columns(df_head):
+            return df_head, True
+    except Exception:
+        pass
+    df_no_head = _read_xls_no_header(uploaded_file)
+    return df_no_head, False
 
 
 # -----------------------
-# Normalizzazione colonne
+# Normalization
 # -----------------------
 def normalize_df_with_headers(df):
-    """
-    Rinomina colonne comuni in colonne standard:
-      Mat, Cognome, Nome, Qualifica, Data_raw, Giorno, Turno_raw, Minuti
-    Crea Turno_tokens (lista di token estratti da Turno_raw)
-    """
     df = df.copy()
     col_map = {}
     for c in df.columns:
-        cn = str(c).strip().lower()
-        if "matric" in cn or cn == "mat":
+        c_norm = str(c).strip().lower()
+        if "matric" in c_norm or c_norm == "mat":
             col_map[c] = "Mat"
-        elif "cognome" in cn:
+        elif "cognome" in c_norm:
             col_map[c] = "Cognome"
-        elif "nome" in cn:
+        elif "nome" in c_norm:
             col_map[c] = "Nome"
-        elif "qualif" in cn:
+        elif "qualif" in c_norm:
             col_map[c] = "Qualifica"
-        elif "data" in cn:
+        elif "data" in c_norm:
             col_map[c] = "Data_raw"
-        elif "gior" in cn:
+        elif "gior" in c_norm:
             col_map[c] = "Giorno"
-        elif "turnoe" in cn or (cn.startswith("turno") and cn.endswith("e")):
+        elif "turnoe" in c_norm or (c_norm.startswith("turno") and c_norm.endswith("e")):
             col_map[c] = "Turno_raw"
-        elif cn.startswith("turno"):
+        elif c_norm.startswith("turno"):
             col_map[c] = "Turno_raw"
-        elif "minut" in cn:
+        elif "minut" in c_norm:
             col_map[c] = "Minuti"
         else:
             col_map[c] = c
     df = df.rename(columns=col_map)
 
-    if "Mat" in df.columns:
-        df["Mat"] = df["Mat"].astype(str).str.strip()
-    else:
-        df["Mat"] = ""
+    df["Mat"] = _ensure_series(df, "Mat").astype(str).str.strip()
+    df["Turno_raw"] = _ensure_series(df, "Turno_raw").astype(str).fillna("").str.strip()
+    df["Turno_tokens"] = df["Turno_raw"].apply(extract_turno_tokens)
 
-    if "Turno_raw" in df.columns:
-        df["Turno_raw"] = df["Turno_raw"].astype(str).fillna("").str.strip()
-        df["Turno_tokens"] = df["Turno_raw"].apply(extract_turno_tokens)
-    else:
-        df["Turno_raw"] = ""
-        df["Turno_tokens"] = [[] for _ in range(len(df))]
-
-    # assicurati esistano colonne opzionali
     for col in ("Cognome", "Nome", "Qualifica", "Data_raw", "Giorno", "Minuti"):
-        if col not in df.columns:
-            df[col] = ""
+        df[col] = _ensure_series(df, col).astype(str).fillna("")
 
     return df
 
 
 def normalize_df_no_header(df):
-    """
-    Quando il file non ha header e ha layout semplice (Mat,Cognome,Nome,...)
-    proviamo a rinominare le prime colonne se sono numeriche 0..n.
-    Se non corrispondono, manteniamo i nomi attuali.
-    """
     df = df.copy()
-    # se le colonne sono numeriche 0.. e abbiamo almeno 8 colonne, mappiamo come atteso
     if df.shape[1] >= 8 and list(df.columns)[:8] == list(range(8)):
         df = df.iloc[:, :8]
         df.columns = ["Mat", "Cognome", "Nome", "Qualifica", "Data_raw", "Giorno", "Turno_raw", "Minuti"]
     else:
-        # fallback: rinomina colonne conosciute se presenti
-        df = df.rename(columns={0: "Mat", 1: "Cognome", 2: "Nome", 3: "Qualifica", 4: "Data_raw", 5: "Giorno", 6: "Turno_raw", 7: "Minuti"})
-    # assicurati tipi
-    if "Mat" in df.columns:
-        df["Mat"] = df["Mat"].astype(str).str.strip()
-    else:
-        df["Mat"] = ""
-    if "Turno_raw" in df.columns:
-        df["Turno_raw"] = df["Turno_raw"].astype(str).fillna("").str.strip()
-        df["Turno_tokens"] = df["Turno_raw"].apply(extract_turno_tokens)
-    else:
-        df["Turno_raw"] = ""
-        df["Turno_tokens"] = [[] for _ in range(len(df))]
+        # prova a rinominare colonne numeriche presenti
+        rename_map = {0: "Mat", 1: "Cognome", 2: "Nome", 3: "Qualifica", 4: "Data_raw", 5: "Giorno", 6: "Turno_raw", 7: "Minuti"}
+        cols_present = {c: rename_map[c] for c in rename_map if c in df.columns}
+        df = df.rename(columns=cols_present)
+
+    df["Mat"] = _ensure_series(df, "Mat").astype(str).str.strip()
+    df["Turno_raw"] = _ensure_series(df, "Turno_raw").astype(str).fillna("").str.strip()
+    df["Turno_tokens"] = df["Turno_raw"].apply(extract_turno_tokens)
+
     for col in ("Cognome", "Nome", "Qualifica", "Data_raw", "Giorno", "Minuti"):
-        if col not in df.columns:
-            df[col] = ""
+        df[col] = _ensure_series(df, col).astype(str).fillna("")
+
     return df
 
 
@@ -243,7 +306,6 @@ def normalize_df_no_header(df):
 # Tokenization / mapping
 # -----------------------
 def extract_turno_tokens(raw_field):
-    """Estrae token alfanumerici dall campo turno, preservando ordine."""
     if raw_field is None:
         return []
     s = str(raw_field).strip()
@@ -254,10 +316,6 @@ def extract_turno_tokens(raw_field):
 
 
 def map_tokens_to_category(tokens, code_to_cat):
-    """
-    Cerca il primo token che matcha una chiave in code_to_cat (case-insensitive).
-    Restituisce (matched_token, category) oppure (None, None).
-    """
     if not tokens:
         return None, None
     upper_map = {k.upper(): v for k, v in code_to_cat.items()}
@@ -272,22 +330,14 @@ def map_tokens_to_category(tokens, code_to_cat):
 # Date handling
 # -----------------------
 def build_date_representation(data_raw, month=None, year=None):
-    """
-    Restituisce stringa dd/mm/YYYY se possibile.
-    - se data_raw è già una data parseable -> formato dd/mm/YYYY
-    - se è un giorno numerico e month/year forniti -> costruisce la data
-    - altrimenti ritorna la rappresentazione stringa originale
-    """
     if pd.isna(data_raw):
         return ""
-    # prova parse
     try:
         dt = pd.to_datetime(data_raw, dayfirst=True, errors="coerce")
         if not pd.isna(dt):
             return dt.strftime("%d/%m/%Y")
     except Exception:
         pass
-    # prova day + month/year
     try:
         day = int(str(data_raw).strip())
         if month is not None and year is not None:
@@ -303,7 +353,6 @@ def build_date_representation(data_raw, month=None, year=None):
 
 
 def infer_month_string_from_dates(df):
-    """Se possibile, inferisce 'Mese YYYY' dalla prima Data_parsed presente."""
     months_it = ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
                  "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"]
     if "Data_parsed" in df.columns:
@@ -314,7 +363,6 @@ def infer_month_string_from_dates(df):
                 return f"{months_it[first.month - 1]} {first.year}"
             except Exception:
                 return None
-    # fallback: prova a parsare Data_raw
     if "Data_raw" in df.columns:
         for v in df["Data_raw"].dropna().tolist():
             try:
@@ -330,28 +378,16 @@ def infer_month_string_from_dates(df):
 # Main processing
 # -----------------------
 def process_workbook(uploaded_file, code_to_cat, infer_month=False, month_for_days=None, year_for_days=None):
-    """
-    Esegue tutto il flusso:
-    - legge il file (read_input_table)
-    - normalizza colonne
-    - costruisce Data_repr/Data_parsed
-    - estrae token e mappa categorie tramite code_to_cat
-    - filtra righe riconosciute e ordina
-    Ritorna: (grouped_df, df_valid, month_string)
-    """
     raw_df, had_header = read_input_table(uploaded_file)
-
-    # normalizzazione
     if had_header:
         df = normalize_df_with_headers(raw_df)
     else:
         df = normalize_df_no_header(raw_df)
 
-    # Data_repr e Data_parsed
+    # Data_repr / Data_parsed
     if "Data_raw" in df.columns:
         df["Data_repr"] = df["Data_raw"].apply(lambda v: build_date_representation(v, month_for_days, year_for_days))
         df["Data_parsed"] = pd.to_datetime(df["Data_raw"], dayfirst=True, errors="coerce")
-        # se month/year forniti proviamo a costruire Data_parsed quando non parseable
         if month_for_days is not None and year_for_days is not None:
             def maybe_build_parsed(v):
                 try:
@@ -367,7 +403,7 @@ def process_workbook(uploaded_file, code_to_cat, infer_month=False, month_for_da
         df["Data_repr"] = ""
         df["Data_parsed"] = pd.NaT
 
-    # mapping token -> category
+    # mapping tokens -> Category
     def map_row_tokens(tokens):
         code, cat = map_tokens_to_category(tokens, code_to_cat)
         return pd.Series({"MatchedCode": code, "Category": cat})
@@ -379,28 +415,22 @@ def process_workbook(uploaded_file, code_to_cat, infer_month=False, month_for_da
         df["MatchedCode"] = None
         df["Category"] = None
 
-    # filtra righe con categoria nota
     df_valid = df[df["Category"].notnull()].copy()
     if df_valid.empty:
-        # ritorna strutture vuote coerenti
         grouped = pd.DataFrame(columns=["Category", "Mat", "Cognome", "Nome", "Qualifica", "Dates", "DaysCount", "RawTurns"])
         return grouped, df_valid, None
 
-    # Nr per riga
     df_valid["Nr"] = 1
-
-    # ordinamento: Category -> Mat (numeric se possibile) -> Data_parsed -> Data_repr
     def try_int(x):
         try:
             return int(x)
         except Exception:
             return x
-
-    df_valid["Mat_sort_key"] = df_valid["Mat"].apply(try_int)
+    df_valid["Mat_sort_key"] = _ensure_series(df_valid, "Mat").apply(try_int)
     df_valid["Data_sort_key"] = df_valid["Data_parsed"].fillna(pd.NaT)
     df_valid = df_valid.sort_values(by=["Category", "Mat_sort_key", "Data_sort_key", "Data_repr"])
 
-    # aggregazione di supporto
+    # grouped
     def dates_agg(x):
         vals = [v for v in x.dropna().tolist() if str(v).strip() != ""]
         seen = []
@@ -423,7 +453,6 @@ def process_workbook(uploaded_file, code_to_cat, infer_month=False, month_for_da
     if infer_month:
         month_string = infer_month_string_from_dates(df_valid)
 
-    # pulizia chiavi temporanee
     if "Mat_sort_key" in grouped.columns:
         grouped = grouped.drop(columns=["Mat_sort_key"])
     if "Mat_sort_key" in df_valid.columns:
@@ -436,11 +465,6 @@ def process_workbook(uploaded_file, code_to_cat, infer_month=False, month_for_da
 # Generazione PDF
 # -----------------------
 def to_pdf_bytes(grouped_df, df_valid, month_string=""):
-    """
-    Genera PDF con il layout per categoria -> matricola -> righe dettagliate + Totale matricola.
-    Restituisce bytes del PDF.
-    (reportlab importato qui per evitare import-time error se non installato)
-    """
     try:
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, PageBreak
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -504,7 +528,6 @@ def to_pdf_bytes(grouped_df, df_valid, month_string=""):
                 totale_row = [f"{mat} Totale"] + [""] * (len(data[0]) - 2) + [str(tot_count)]
                 data.append(totale_row)
 
-                # crea tabella
                 colWidths = [20 * mm, 40 * mm, 40 * mm, 25 * mm, 22 * mm, 25 * mm, 20 * mm, 15 * mm, 12 * mm]
                 table = Table(data, colWidths=colWidths)
                 tbl_style = TableStyle([
