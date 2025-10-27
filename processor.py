@@ -172,17 +172,24 @@ def _read_flexible_excel_or_text(uploaded_file, header=0, prefer_header_detectio
     raise RuntimeError("Tentativi di lettura falliti: file non riconosciuto come Excel/CSV/HTML.")
 
 
-# wrappers used by rest of module
 def _read_xls_try_header(uploaded_file):
-    df = _read_flexible_excel_or_text(uploaded_file, header=0)
+    """
+    Wrapper corretto: chiama il reader flessibile e ritorna solo il DataFrame (non una tupla).
+    """
+    df, had_header = _read_flexible_excel_or_text(uploaded_file, header=0)
     return df
 
 
 def _read_xls_no_header(uploaded_file):
-    df = _read_flexible_excel_or_text(uploaded_file, header=None)
-    # If header=None produced numeric column names 0..n-1 and >=8 cols, map to expected no-header layout
+    """
+    Wrapper corretto per read senza header: ritorna solo il DataFrame.
+    Se il reader ritorna colonne numeriche 0..n-1 e ci sono >=8 colonne,
+    mappa le prime 8 sulle colonne attese del formato no-header.
+    """
+    df, had_header = _read_flexible_excel_or_text(uploaded_file, header=None)
     if df is None:
         raise RuntimeError("Impossibile leggere il file.")
+    # map no-header numeric columns to expected layout if applicable
     if df.shape[1] >= 8 and list(df.columns)[:8] == list(range(8)):
         df = df.iloc[:, :8]
         df.columns = ['Mat', 'Cognome', 'Nome', 'Qualifica', 'Data', 'Giorno', 'Turno', 'Minuti']
