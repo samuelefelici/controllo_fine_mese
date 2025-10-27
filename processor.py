@@ -1,9 +1,10 @@
 # processor.py
 """
-Processor resilient to files that are .xls but actually text (CSV/TSV/HTML) or true Excel.
-- read_input_table tries flexible parsers and falls back to CSV/HTML parsing.
-- rest of logic: normalization, token extraction, mapping, aggregation, PDF generation.
-Note: no data validation is performed — the module extracts diciture.
+Processor robusto che supporta anche file .txt/.csv oltre a .xls/.xlsx.
+- read_input_table prova: read_excel (xlrd/openpyxl), poi parsing testuale (txt/csv) con varie encoding e delimitatori,
+  poi HTML table fallback.
+- Nessuna validazione sui dati: estrae token da campo turno, mappa con codes.csv e aggrega.
+- to_pdf_bytes mantiene import reportlab localmente.
 """
 
 import re
@@ -15,13 +16,9 @@ from pathlib import Path
 import pandas as pd
 
 
-# -----------------------
-# codes.csv loader (supports path or file-like)
-# -----------------------
 def load_codes_map(codes_csv_path):
     try:
         if not isinstance(codes_csv_path, (str, Path)):
-            # file-like (Streamlit UploadedFile)
             try:
                 df = pd.read_csv(codes_csv_path, dtype=str).fillna("")
             except Exception:
@@ -50,156 +47,142 @@ def load_codes_map(codes_csv_path):
 
 
 # -----------------------
-# Flexible Excel / CSV / HTML reader
+# Flexible reader (Excel / CSV / TXT / HTML)
 # -----------------------
+def _try_read_excel_bytes(raw_bytes, engine):
+    try:
+        return pd.read_excel(BytesIO(raw_bytes), header=0, engine=engine)
+    except Exception:
+        return None
+
+
+def _detect_encoding_and_try_csv(raw_bytes):
+    encodings = ["utf-8", "cp1252", "latin-1", "cp1250", "iso-8859-1"]
+    delimiters = [";", "\t", ",", "|"]
+    for enc in encodings:
+        try:
+            text = raw_bytes.decode(enc)
+        except Exception:
+            continue
+        sample = text[:8192]
+        # try csv sniffer
+        try:
+            sniffer = csv.Sniffer()
+            dialect = sniffer.sniff(sample)
+            delim = dialect.delimiter
+            has_header = sniffer.has_header(sample)
+            df = pd.read_csv(StringIO(text), sep=delim, header=0 if has_header else None, engine="python")
+            return df, enc, delim, bool(has_header)
+        except Exception:
+            # fallback common delimiters
+            for d in delimiters:
+                try:
+                    df = pd.read_csv(StringIO(text), sep=d, header=0, engine="python")
+                    if df.shape[1] > 1:
+                        return df, enc, d, True
+                except Exception:
+                    continue
+    # last attempt: whitespace-separated
+    for enc in encodings:
+        try:
+            text = raw_bytes.decode(enc)
+            df = pd.read_csv(StringIO(text), sep=r'\s+', header=0, engine="python")
+            if df.shape[1] > 1:
+                return df, enc, r'\s+', True
+        except Exception:
+            continue
+    return None, None, None, None
+
+
 def _read_flexible_excel_or_text(uploaded_file, header=0, prefer_header_detection=True):
     """
     Prova diversi metodi per leggere input che potrebbe essere:
-    - un .xls/.xlsx Excel vero (pandas.read_excel)
-    - un file di testo (CSV/TSV) salvato con estensione .xls
-    - un HTML contenente una tabella Excel-like
-
-    Ritorna: (df, had_header_flag)
+    - Excel (.xls/.xlsx) vero
+    - file di testo (.csv/.txt) con vari encoding/delim
+    - HTML con tabella
+    Ritorna (df, had_header_flag)
     """
-    # Leggi bytes tutti in memoria così riusiamo più volte il contenuto
+    # read all bytes
     if hasattr(uploaded_file, "read"):
         raw = uploaded_file.read()
-        # riportiamo il puntatore all'inizio per sicurezza (strumenti che poi lo leggono)
         try:
             uploaded_file.seek(0)
         except Exception:
             pass
     else:
-        # uploaded_file è un str/Path
         raw = Path(uploaded_file).read_bytes()
 
-    # Primo tentativo: se abbiamo un nome con estensione, proviamo read_excel con engine corretto
     filename = getattr(uploaded_file, "name", None)
     ext = Path(filename).suffix.lower() if filename else ""
 
-    # Utility per provare read_excel con una combinazione di engine
-    def try_read_excel(bytes_buf, engine=None, header=header):
-        try:
-            return pd.read_excel(BytesIO(bytes_buf), header=header, engine=engine), True
-        except Exception:
-            return None, False
+    # 1) if it's a zipfile (xlsx) try openpyxl
+    try:
+        import zipfile
+        if zipfile.is_zipfile(BytesIO(raw)):
+            df = _try_read_excel_bytes(raw, engine="openpyxl")
+            if df is not None:
+                return df, True
+    except Exception:
+        pass
 
-    # Se estensione è nota, prova engine specifico
-    tried = []
-    if ext == ".xlsx" or ext in (".xlsm", ".xltx", ".xltm"):
-        df, ok = try_read_excel(raw, engine="openpyxl", header=header)
-        tried.append(("openpyxl", ok))
-        if ok:
-            return df, True
+    # 2) Try read_excel with engines (engine selection for .xls/.xlsx)
+    # If ext suggests engine preference, try preferred first
+    tried_engines = []
+    if ext == ".xlsx":
+        for engine in ("openpyxl",):
+            df = _try_read_excel_bytes(raw, engine=engine)
+            tried_engines.append((engine, df is not None))
+            if df is not None:
+                return df, True
     elif ext == ".xls":
-        # xlrd>=2.0.1 legge .xls
-        df, ok = try_read_excel(raw, engine="xlrd", header=header)
-        tried.append(("xlrd", ok))
-        if ok:
-            return df, True
+        for engine in ("xlrd",):
+            df = _try_read_excel_bytes(raw, engine=engine)
+            tried_engines.append((engine, df is not None))
+            if df is not None:
+                return df, True
 
-    # Generic attempts: try openpyxl, xlrd (order doesn't matter much)
+    # generic attempts
     for engine in ("openpyxl", "xlrd"):
-        df, ok = try_read_excel(raw, engine=engine, header=header)
-        tried.append((engine, ok))
-        if ok:
+        df = _try_read_excel_bytes(raw, engine=engine)
+        tried_engines.append((engine, df is not None))
+        if df is not None:
             return df, True
 
-    # If all read_excel attempts failed, try to interpret the bytes as text
-    # decode trying utf-8 then latin-1
-    text = None
-    for enc in ("utf-8", "latin-1", "cp1252"):
-        try:
-            text = raw.decode(enc)
-            break
-        except Exception:
-            continue
-    if text is None:
-        # fallback using replace
-        text = raw.decode("utf-8", errors="replace")
+    # 3) Try parse as text (CSV/TXT) with multiple encodings and delimiters
+    df, enc, delim, has_header = _detect_encoding_and_try_csv(raw)
+    if df is not None:
+        return df, True if has_header else False
 
-    # Trim leading whitespace
-    text_lstripped = text.lstrip()
-
-    # If it looks like HTML, try pd.read_html
-    if text_lstripped.startswith("<") or "<table" in text_lstripped.lower():
-        try:
+    # 4) Try HTML
+    try:
+        text = None
+        for enc in ("utf-8", "cp1252", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except Exception:
+                continue
+        if text and ("<table" in text.lower() or "<html" in text.lower()):
             tables = pd.read_html(StringIO(text))
             if tables:
-                # choose first table
                 return tables[0], True
-        except Exception:
-            pass
-
-    # Try to detect delimiter using csv.Sniffer
-    sample = text[:4096]
-    sniffer = csv.Sniffer()
-    detected_delim = None
-    has_header = False
-    try:
-        dialect = sniffer.sniff(sample)
-        detected_delim = dialect.delimiter
-        try:
-            has_header = sniffer.has_header(sample)
-        except Exception:
-            has_header = prefer_header_detection
     except Exception:
-        # Fallback delimiters order to try
-        for d in ["\t", ";", ",", "|"]:
-            if d in sample:
-                detected_delim = d
-                break
-
-    if detected_delim is None:
-        # fallback: try tab, semicolon, comma
-        for d in ["\t", ";", ",", "|"]:
-            try:
-                df = pd.read_csv(StringIO(text), sep=d, header=0 if prefer_header_detection else None, engine="python")
-                # if dataframe has multiple columns it's likely correct
-                if df.shape[1] > 1:
-                    return df, True if prefer_header_detection else False
-            except Exception:
-                continue
-        # last resort: try read_csv with whitespace delim
-        try:
-            df = pd.read_csv(StringIO(text), sep=r'\s+', header=0 if prefer_header_detection else None, engine="python")
-            return df, True if prefer_header_detection else False
-        except Exception:
-            raise RuntimeError("Impossibile interpretare il file come Excel/CSV/HTML. Il file potrebbe essere corrotto o in formato non supportato.")
-
-    # If we have a detected delimiter:
-    try:
-        header_row = 0 if has_header else None
-        df = pd.read_csv(StringIO(text), sep=detected_delim, header=header_row, engine="python")
-        # If header detection thought no header but first row looks like column names (non-numeric), keep header=None
-        return df, True if header_row == 0 else False
-    except Exception:
-        # try a few common encodings/params
-        for encoding in ("utf-8", "latin-1", "cp1252"):
-            try:
-                df = pd.read_csv(StringIO(text), sep=detected_delim, header=(0 if prefer_header_detection else None), encoding=encoding, engine="python")
-                return df, True if prefer_header_detection else False
-            except Exception:
-                continue
+        pass
 
     raise RuntimeError("Tentativi di lettura falliti: file non riconosciuto come Excel/CSV/HTML.")
 
 
-# -----------------------
-# Wrappers used by rest of processor
-# -----------------------
+# wrappers used by rest of module
 def _read_xls_try_header(uploaded_file):
-    # use flexible reader but ask for header=0
-    df, had_header = _read_flexible_excel_or_text(uploaded_file, header=0)
+    df = _read_flexible_excel_or_text(uploaded_file, header=0)
     return df
 
 
 def _read_xls_no_header(uploaded_file):
-    df, had_header = _read_flexible_excel_or_text(uploaded_file, header=None)
-    # If no header returned but df has >=8 columns, take first 8 as earlier expectation
+    df = _read_flexible_excel_or_text(uploaded_file, header=None)
+    # If header=None produced numeric column names 0..n-1 and >=8 cols, map to expected no-header layout
     if df is None:
         raise RuntimeError("Impossibile leggere il file.")
-    # If header=None produced column names like 0,1,2... we map to expected names
     if df.shape[1] >= 8 and list(df.columns)[:8] == list(range(8)):
         df = df.iloc[:, :8]
         df.columns = ['Mat', 'Cognome', 'Nome', 'Qualifica', 'Data', 'Giorno', 'Turno', 'Minuti']
@@ -217,7 +200,6 @@ def _has_expected_header_columns(df):
 
 
 def read_input_table(uploaded_file):
-    # First attempt header read; if not recognized fallback to no-header version
     try:
         df_head = _read_xls_try_header(uploaded_file)
         if _has_expected_header_columns(df_head):
@@ -230,7 +212,7 @@ def read_input_table(uploaded_file):
 
 # -----------------------
 # Normalizzazione, tokenization, mapping, date handling, aggregation, PDF
-# (keep same logic as previous processor; see earlier messages for full implementation)
+# (rest of module similar to previous implementation)
 # -----------------------
 
 def normalize_df_with_headers(df):
