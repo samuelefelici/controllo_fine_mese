@@ -283,7 +283,6 @@ def normalize_df_with_headers(df):
         df[col] = _ensure_series(df, col).astype(str).fillna("")
 
     return df
-    return df
 
 
 def normalize_df_no_header(df):
@@ -299,7 +298,9 @@ def normalize_df_no_header(df):
 
     df["Mat"] = _ensure_series(df, "Mat").astype(str).str.strip()
     df["Turno_raw"] = _ensure_series(df, "Turno_raw").astype(str).fillna("").str.strip()
-    df["Turno_tokens"] = df["Turno_raw"].apply(extract_turno_tokens)
+
+    # costruzione Turno_tokens con list comprehension
+    df["Turno_tokens"] = [extract_turno_tokens(x) for x in df["Turno_raw"].astype(str).fillna("")]
 
     for col in ("Cognome", "Nome", "Qualifica", "Data_raw", "Giorno", "Minuti"):
         df[col] = _ensure_series(df, col).astype(str).fillna("")
