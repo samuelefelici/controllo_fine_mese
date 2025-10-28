@@ -83,26 +83,68 @@ if uploaded_file is None:
     st.stop()
 
 # ================================================================
-# LETTURA FILE GREZZO (anche se è falso .xls)
+# LETTURA FILE GREZZO (robusta, non consuma lo stream usato dopo)
 # ================================================================
 with st.spinner("Tentativo di lettura del file..."):
+    # Leggiamo tutti i bytes una volta sola e poi creiamo BytesIO per anteprima + elaborazione.
     try:
-        df = pd.read_excel(uploaded_file, header=0, engine="openpyxl")
-        st.success("File letto come Excel (.xlsx)")
+        raw_bytes = uploaded_file.read()
     except Exception:
-        uploaded_file.seek(0)
-        raw = uploaded_file.read()
+        # fallback: se non è possibile leggere direttamente, proviamo a usare uploaded_file.getvalue()
         try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            text = raw.decode("latin-1", errors="replace")
+            raw_bytes = uploaded_file.getvalue()
+        except Exception as e:
+            st.error(f"Impossibile leggere il file caricato: {e}")
+            st.stop()
 
+    preview_df = None
+    read_ok = False
+    # Proviamo a leggere come Excel (.xlsx) con openpyxl, poi senza engine, poi con xlrd (.xls)
+    try:
+        preview_df = pd.read_excel(BytesIO(raw_bytes), header=0, engine="openpyxl", dtype=str)
+        st.success("File letto come Excel (.xlsx) con openpyxl")
+        read_ok = True
+    except Exception:
+        # proviamo senza specificare engine (pandas sceglie)
         try:
-            df = pd.read_csv(StringIO(text), sep="\t", header=0)
-            st.success("File letto come testo tabulato (.txt travestito da .xls)")
+            preview_df = pd.read_excel(BytesIO(raw_bytes), header=0, dtype=str)
+            st.success("File letto come Excel (engine auto)")
+            read_ok = True
         except Exception:
-            df = pd.read_csv(StringIO(text), sep=";", header=0)
-            st.success("File letto come CSV separato da ';'")
+            # proviamo engine xlrd (per .xls). Nota: xlrd recenti non supportano xlsx; potrebbe essere necessario xlrd==1.2.0
+            try:
+                preview_df = pd.read_excel(BytesIO(raw_bytes), header=0, engine="xlrd", dtype=str)
+                st.success("File letto come Excel (.xls) con xlrd")
+                read_ok = True
+            except Exception:
+                # Non è stato possibile leggere come Excel: proviamo come testo/csv
+                pass
+
+    if not read_ok:
+        # Decodifica testo provando utf-8 prima, poi latin-1 (cp1252 già gestito come latin-1)
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw_bytes.decode("latin-1", errors="replace")
+
+        # Proviamo separatori comuni
+        tried = []
+        for sep, label in [("\t", ".txt (tab)"), (";", "CSV ';'"), (",", "CSV ','")]:
+            try:
+                preview_df = pd.read_csv(StringIO(text), sep=sep, header=0, dtype=str)
+                st.success(f"File letto come testo: {label}")
+                read_ok = True
+                break
+            except Exception as e:
+                tried.append((sep, str(e)))
+                continue
+
+        if not read_ok:
+            st.error("Impossibile interpretare il file come Excel o testo tabulato/CSV.")
+            st.stop()
+
+    # Se siamo qui preview_df è valorizzato
+    df = preview_df.fillna("")
 
 st.write("✅ Anteprima file caricato:")
 st.dataframe(df.head(20))
@@ -112,12 +154,15 @@ for i, c in enumerate(df.columns):
     st.write(f"{i}: {c}")
 
 # ================================================================
-# ELABORAZIONE NORMALE
+# ELABORAZIONE NORMALE (usiamo BytesIO(raw_bytes) per non dipendere dallo stream consumato)
 # ================================================================
 with st.spinner("Elaborazione file..."):
     try:
+        # Creiamo un nuovo BytesIO per la funzione di process_workbook (pointer a 0)
+        file_for_processing = BytesIO(raw_bytes)
+        file_for_processing.seek(0)
         grouped_df, df_valid, inferred_month_str = process_workbook(
-            uploaded_file,
+            file_for_processing,
             codes_map,
             infer_month=infer_month,
             month_for_days=month_num,
