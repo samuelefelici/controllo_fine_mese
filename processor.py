@@ -90,7 +90,11 @@ def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
     }
     df = df.rename(columns=col_map)
 
-    # pulizia
+    # Se manca la colonna "Qualifica", aggiungila vuota per compatibilità app.py
+    if "Qualifica" not in df.columns:
+        df["Qualifica"] = ""
+
+    # Pulizia base
     df["Mat"] = df["Mat"].astype(str).str.strip()
     df["Cognome"] = df["Cognome"].astype(str).str.strip().str.upper()
     df["Nome"] = df["Nome"].astype(str).str.strip().str.upper()
@@ -106,12 +110,13 @@ def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
         df["TurnoE"].astype(str).fillna("").str.strip().replace("nan", "")
     )
 
-    # tokenizzazione turno
+    # Tokenizzazione turno
     df["Turno_tokens"] = df["Turno_raw"].apply(
         lambda x: [t.strip() for t in str(x).split() if t.strip()]
     )
 
     return df
+
 
 
 # ============================================================
