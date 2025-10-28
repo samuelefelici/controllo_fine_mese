@@ -173,14 +173,35 @@ def build_date_representation(data_raw, month=None, year=None):
         return str(data_raw)
 
 
-def process_workbook(uploaded_file, code_to_cat, month_for_days=None, year_for_days=None):
+def process_workbook(
+    uploaded_file,
+    code_to_cat,
+    infer_month: bool = False,     # <-- parametro reintrodotto e ignorato
+    month_for_days: int | None = None,
+    year_for_days: int | None = None,
+):
     """Flusso principale di elaborazione Conerobus."""
     raw_df, _ = _read_xls_try_header(uploaded_file)
     df = normalize_conerobus_df(raw_df)
     df = map_turni_to_category(df, code_to_cat)
 
-    df["Data_repr"] = df["Data_raw"].apply(lambda v: build_date_representation(v, month_for_days, year_for_days))
+    # Data leggibile dal numero giorno + mese/anno forniti
+    df["Data_repr"] = df["Data_raw"].apply(
+        lambda v: build_date_representation(v, month_for_days, year_for_days)
+    )
 
+    # (opzionale) una Data_parsed, utile per ordinamenti cronologici in app.py
+    def _to_ts(v):
+        try:
+            d = int(str(v).strip())
+            if month_for_days and year_for_days:
+                return pd.Timestamp(year_for_days, month_for_days, d)
+        except Exception:
+            pass
+        return pd.NaT
+    df["Data_parsed"] = df["Data_raw"].apply(_to_ts)
+
+    # Filtra solo righe con categoria mappata
     df_valid = df[df["Category"].notnull()].copy()
     if df_valid.empty:
         return pd.DataFrame(), pd.DataFrame(), None
@@ -191,13 +212,21 @@ def process_workbook(uploaded_file, code_to_cat, month_for_days=None, year_for_d
         vals = [v for v in x.dropna().unique() if str(v).strip()]
         return ", ".join(map(str, vals))
 
-    grouped = df_valid.groupby(["Category", "Mat", "Cognome", "Nome"], sort=False).agg(
-        Dates=("Data_repr", dates_agg),
-        DaysCount=("Data_repr", "nunique"),
-        RawTurns=("Turno_raw", lambda s: ", ".join(pd.Series(s.dropna().unique()).astype(str).tolist()))
-    ).reset_index()
+    grouped = (
+        df_valid
+        .groupby(["Category", "Mat", "Cognome", "Nome"], sort=False)
+        .agg(
+            Dates=("Data_repr", dates_agg),
+            DaysCount=("Data_repr", "nunique"),
+            RawTurns=("Turno_raw", lambda s: ", ".join(pd.Series(s.dropna().unique()).astype(str).tolist())),
+        )
+        .reset_index()
+    )
 
-    return grouped, df_valid, None
+    # Non inferiamo più il mese: lasciamo None e lo gestisce app.py
+    month_string = None
+    return grouped, df_valid, month_string
+
 
 
 # ============================================================
