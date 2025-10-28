@@ -65,14 +65,17 @@ def _detect_encoding_and_try_csv(raw_bytes: bytes) -> Tuple[Optional[pd.DataFram
     return None, None, None
 
 
-def _read_xls_try_header(uploaded_file: Union[bytes, Path, object], max_header_row_search: int = 10) -> Tuple[pd.DataFrame, bool]:
-    """Legge un file Excel o CSV/TXT cercando automaticamente la riga di header.
+def _read_xls_try_header(uploaded_file, max_header_row_search=10):
+    # rewind se possibile
+    if hasattr(uploaded_file, "seek"):
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
 
-    Prova header=0..max_header_row_search-1 e sceglie la riga che contiene parole chiave tipiche.
-    Restituisce (DataFrame, True) se lettura avvenuta con successo.
-    """
     if hasattr(uploaded_file, "read"):
         raw = uploaded_file.read()
+        # dopo la lettura, riportiamo il pointer all'inizio per sicurezza
         try:
             uploaded_file.seek(0)
         except Exception:
@@ -83,29 +86,38 @@ def _read_xls_try_header(uploaded_file: Union[bytes, Path, object], max_header_r
     filename = getattr(uploaded_file, "name", "") or str(uploaded_file)
     ext = Path(filename).suffix.lower()
 
-    keywords = {"mat", "matricola", "cognome", "nome", "turno", "turnoe", "giorno", "data", "residenza"}
-
-    # Se è Excel (xlsx/xls) proviamo a cercare la riga header contenente keyword
+    # Prima proviamo a usare pd.read_excel con engine appropriato
     if ext in (".xls", ".xlsx"):
-        for header_row in range(0, max_header_row_search):
-            try:
-                # dtype=str per evitare conversioni strane che alterano i nomi colonne
-                df_try = pd.read_excel(BytesIO(raw), header=header_row, dtype=str)
-                cols_text = " ".join([str(c).lower() for c in df_try.columns])
-                if any(k in cols_text for k in keywords):
-                    return df_try, True
-            except Exception:
-                # ignora e prova la riga successiva
-                continue
-        # fallback: prova a leggere comunque con header=0
+        # proviamo a lasciare che pandas scelga o forzire engine se presente
+        engines_to_try = []
+        if ext == ".xlsx":
+            engines_to_try = ["openpyxl"]
+        else:
+            # .xls: proviamo xlrd (richiede xlrd installato, o fallback a engine auto)
+            engines_to_try = ["xlrd", None]
+
+        for engine in engines_to_try:
+            for header_row in range(0, max_header_row_search):
+                try:
+                    if engine is None:
+                        df_try = pd.read_excel(BytesIO(raw), header=header_row, dtype=str)
+                    else:
+                        df_try = pd.read_excel(BytesIO(raw), header=header_row, engine=engine, dtype=str)
+                    cols_text = " ".join([str(c).lower() for c in df_try.columns])
+                    keywords = {"mat", "matricola", "cognome", "nome", "turno", "giorno", "residenza"}
+                    if any(k in cols_text for k in keywords):
+                        return df_try, True
+                except Exception:
+                    # ignora e proviamo con la prossima riga/engine
+                    continue
+        # fallback: proviamo almeno header=0 senza engine specifico
         try:
             df = pd.read_excel(BytesIO(raw), header=0, dtype=str)
             return df, True
         except Exception:
-            # non è un excel leggibile, continueremo con rilevamento CSV/TXT
             pass
 
-    # Proviamo come CSV/TXT / file di testo con rilevamento di encoding e separatore
+    # Altrimenti proviamo il rilevamento CSV/TXT (come prima)
     df_detect, enc, delim = _detect_encoding_and_try_csv(raw)
     if df_detect is not None:
         return df_detect, True
