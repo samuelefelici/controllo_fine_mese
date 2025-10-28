@@ -1,19 +1,16 @@
 """
-processor.py - versione Conerobus (ottobre 2025)
+processor.py - versione Conerobus (ottobre 2025) - AGGIORNATO
 
-Specifico per i file mensili Conerobus:
-- Colonna B = Matricola
-- Colonna C = Cognome
-- Colonna D = Nome
-- Colonna E = Giorno numerico (1–31)
-- Colonna F = Tipo giorno (Lun, Mar, Mer…)
-- Colonna M = TurnoE (codice turno)
-
-Gestione semplificata e robusta:
-- Lettura automatica CSV/XLS con ricerca riga header
-- Normalizzazione tollerante basata su riconoscimento colonne
-- Mapping codici → categorie tramite codes.csv
-- Aggregazione e generazione PDF
+Struttura file mensile Conerobus (NUOVA):
+- Colonna 0 = Residenza
+- Colonna 1 = Matricola
+- Colonna 2 = Cognome
+- Colonna 3 = Nome
+- Colonna 4 = Gruppo
+- Colonna 5 = Data (giorno numerico 1-31)
+- Colonna 6 = TurnoC
+- Colonna 7-10 = Altri campi TurnoC
+- Colonna 11 = TurnoE (codice turno che ci interessa)
 """
 
 import re
@@ -42,7 +39,6 @@ def _detect_encoding_and_try_csv(raw_bytes: bytes) -> Tuple[Optional[pd.DataFram
         except Exception:
             continue
 
-        # proviamo diversi separatori
         for d in delims:
             try:
                 df = pd.read_csv(StringIO(text), sep=d, header=0, dtype=str)
@@ -51,7 +47,6 @@ def _detect_encoding_and_try_csv(raw_bytes: bytes) -> Tuple[Optional[pd.DataFram
             except Exception:
                 continue
 
-        # fallback: usare csv.Sniffer per provare a indovinare il separatore
         try:
             sniffer = csv.Sniffer()
             dialect = sniffer.sniff(text[:4096])
@@ -66,7 +61,6 @@ def _detect_encoding_and_try_csv(raw_bytes: bytes) -> Tuple[Optional[pd.DataFram
 
 
 def _read_xls_try_header(uploaded_file, max_header_row_search=10):
-    # rewind se possibile
     if hasattr(uploaded_file, "seek"):
         try:
             uploaded_file.seek(0)
@@ -75,7 +69,6 @@ def _read_xls_try_header(uploaded_file, max_header_row_search=10):
 
     if hasattr(uploaded_file, "read"):
         raw = uploaded_file.read()
-        # dopo la lettura, riportiamo il pointer all'inizio per sicurezza
         try:
             uploaded_file.seek(0)
         except Exception:
@@ -86,14 +79,11 @@ def _read_xls_try_header(uploaded_file, max_header_row_search=10):
     filename = getattr(uploaded_file, "name", "") or str(uploaded_file)
     ext = Path(filename).suffix.lower()
 
-    # Prima proviamo a usare pd.read_excel con engine appropriato
     if ext in (".xls", ".xlsx"):
-        # proviamo a lasciare che pandas scelga o forzire engine se presente
         engines_to_try = []
         if ext == ".xlsx":
             engines_to_try = ["openpyxl"]
         else:
-            # .xls: proviamo xlrd (richiede xlrd installato, o fallback a engine auto)
             engines_to_try = ["xlrd", None]
 
         for engine in engines_to_try:
@@ -104,20 +94,17 @@ def _read_xls_try_header(uploaded_file, max_header_row_search=10):
                     else:
                         df_try = pd.read_excel(BytesIO(raw), header=header_row, engine=engine, dtype=str)
                     cols_text = " ".join([str(c).lower() for c in df_try.columns])
-                    keywords = {"mat", "matricola", "cognome", "nome", "turno", "giorno", "residenza"}
+                    keywords = {"mat", "matricola", "cognome", "nome", "turno", "data", "residenza"}
                     if any(k in cols_text for k in keywords):
                         return df_try, True
                 except Exception:
-                    # ignora e proviamo con la prossima riga/engine
                     continue
-        # fallback: proviamo almeno header=0 senza engine specifico
         try:
             df = pd.read_excel(BytesIO(raw), header=0, dtype=str)
             return df, True
         except Exception:
             pass
 
-    # Altrimenti proviamo il rilevamento CSV/TXT (come prima)
     df_detect, enc, delim = _detect_encoding_and_try_csv(raw)
     if df_detect is not None:
         return df_detect, True
@@ -130,9 +117,7 @@ def _read_xls_try_header(uploaded_file, max_header_row_search=10):
 # ============================================================
 
 def _find_col_by_keywords(df: pd.DataFrame, keywords: List[str], fallback_index: Optional[int] = None) -> Optional[str]:
-    """Cerca una colonna il cui nome contiene una delle keywords (case-insensitive).
-    Se non trova nulla, ritorna la colonna alla posizione fallback_index se valida, altrimenti None.
-    """
+    """Cerca una colonna il cui nome contiene una delle keywords (case-insensitive)."""
     lowered = [str(c).lower() for c in df.columns]
     for i, name in enumerate(lowered):
         for kw in keywords:
@@ -144,91 +129,78 @@ def _find_col_by_keywords(df: pd.DataFrame, keywords: List[str], fallback_index:
 
 
 # ============================================================
-# NORMALIZZAZIONE (struttura fissa Conerobus) - più robusta
+# NORMALIZZAZIONE (struttura AGGIORNATA Conerobus)
 # ============================================================
 
 def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalizza il file mensile Conerobus con struttura fissa:
-    B=Matricola, C=Cognome, D=Nome, E=Data (giorno numerico),
-    F=Tipo giorno (Lun, Mar...), M=TurnoE (codice turno).
-
-    Questa versione non si basa esclusivamente sugli indici di colonna: cerca
-    le colonne per parole chiave e usa indici di fallback quando necessario.
-    Gestisce anche colonne vuote iniziali (es. 5 colonne vuote).
+    Normalizza il file mensile Conerobus con struttura AGGIORNATA:
+    0=Residenza, 1=Matricola, 2=Cognome, 3=Nome, 4=Gruppo,
+    5=Data (giorno numerico), 11=TurnoE
     """
     df = df.copy()
     df = df.dropna(how="all")
     if df.empty:
         return df
 
-    # Indici attesi originali (0-based) dalla versione Conerobus
+    # INDICI CORRETTI per la NUOVA struttura
     expected_indices = {
+        "Residenza": 0,
         "Mat": 1,
         "Cognome": 2,
         "Nome": 3,
+        "Gruppo": 4,
         "Data_raw": 5,
-        "Giorno": 6,
-        "TurnoE": 12,
+        "TurnoE": 11,
     }
 
-    # Se esiste una colonna con nome 'mat' o 'matricola', usiamola per rilevare eventuale offset
-    lowered = [str(c).strip().lower() for c in df.columns]
-    found_mat_idx = None
-    for i, name in enumerate(lowered):
-        if "mat" in name or "matricola" in name:
-            found_mat_idx = i
-            break
-
-    offset = 0
-    if found_mat_idx is not None:
-        offset = found_mat_idx - expected_indices["Mat"]
-        # non permettiamo offset negativo automatico
-        if offset < 0:
-            offset = 0
-
-    # Proviamo a trovare colonne per keyword, passando fallback indicizzato corretto (applicando offset)
-    mat_col = _find_col_by_keywords(df, ["mat", "matricola"], fallback_index=expected_indices["Mat"] + offset)
-    cognome_col = _find_col_by_keywords(df, ["cognome", "surname", "cognome"], fallback_index=expected_indices["Cognome"] + offset)
-    nome_col = _find_col_by_keywords(df, ["nome", "name"], fallback_index=expected_indices["Nome"] + offset)
-    data_col = _find_col_by_keywords(df, ["data", "giorno", "day"], fallback_index=expected_indices["Data_raw"] + offset)
-    giorno_col = _find_col_by_keywords(df, ["tipo", "giorno", "gg", "giorn"], fallback_index=expected_indices["Giorno"] + offset)
-    turno_col = _find_col_by_keywords(df, ["turno", "turnoe", "turnoE", "codice"], fallback_index=expected_indices["TurnoE"] + offset)
+    # Ricerca colonne con fallback agli indici corretti
+    residenza_col = _find_col_by_keywords(df, ["residenza", "sede"], fallback_index=0)
+    mat_col = _find_col_by_keywords(df, ["mat", "matricola"], fallback_index=1)
+    cognome_col = _find_col_by_keywords(df, ["cognome", "surname"], fallback_index=2)
+    nome_col = _find_col_by_keywords(df, ["nome", "name"], fallback_index=3)
+    gruppo_col = _find_col_by_keywords(df, ["gruppo", "group"], fallback_index=4)
+    data_col = _find_col_by_keywords(df, ["data", "giorno", "day"], fallback_index=5)
+    turno_col = _find_col_by_keywords(df, ["turnoe", "turno e", "turnoE"], fallback_index=11)
 
     col_map = {}
+    if residenza_col is not None:
+        col_map[residenza_col] = "Residenza"
     if mat_col is not None:
         col_map[mat_col] = "Mat"
     if cognome_col is not None:
         col_map[cognome_col] = "Cognome"
     if nome_col is not None:
         col_map[nome_col] = "Nome"
+    if gruppo_col is not None:
+        col_map[gruppo_col] = "Gruppo"
     if data_col is not None:
         col_map[data_col] = "Data_raw"
-    if giorno_col is not None:
-        col_map[giorno_col] = "Giorno"
     if turno_col is not None:
         col_map[turno_col] = "TurnoE"
 
-    # Rinominazione (se col_map è vuoto non farà nulla)
     if col_map:
         df = df.rename(columns=col_map)
 
-    # Garantiamo l'esistenza delle colonne usate dal flusso
-    for required in ["Mat", "Cognome", "Nome", "Data_raw", "Giorno", "TurnoE"]:
+    # Garantiamo l'esistenza delle colonne necessarie
+    for required in ["Residenza", "Mat", "Cognome", "Nome", "Gruppo", "Data_raw", "TurnoE"]:
         if required not in df.columns:
             df[required] = ""
 
-    # Se manca la colonna "Qualifica", aggiungila vuota per compatibilità app.py
+    # Aggiungiamo colonne per compatibilità con app.py
     if "Qualifica" not in df.columns:
         df["Qualifica"] = ""
+    if "Giorno" not in df.columns:
+        df["Giorno"] = ""
 
-    # Pulizia base, con protezioni
+    # Pulizia dati
+    df["Residenza"] = df["Residenza"].astype(str).str.strip().str.upper().replace("NAN", "")
     df["Mat"] = df["Mat"].astype(str).str.strip().replace("nan", "")
     df["Cognome"] = df["Cognome"].astype(str).str.strip().str.upper().replace("NAN", "")
     df["Nome"] = df["Nome"].astype(str).str.strip().str.upper().replace("NAN", "")
-    df["Giorno"] = df["Giorno"].astype(str).str.strip().str.capitalize().replace("Nan", "")
+    df["Gruppo"] = df["Gruppo"].astype(str).str.strip().replace("nan", "")
 
-    # Data (giorno numerico) - estraiamo il primo numero nella cella
+    # Data (estrazione numero giorno)
     def _extract_first_number(v):
         s = str(v)
         m = re.search(r"(\d+)", s)
@@ -239,7 +211,7 @@ def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
     # Turno
     df["Turno_raw"] = df["TurnoE"].astype(str).fillna("").str.strip().replace("nan", "")
 
-    # Tokenizzazione turno (lista di token)
+    # Tokenizzazione turno
     def _tokenize_turno(x):
         if x is None:
             return []
@@ -257,12 +229,8 @@ def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 
 def load_codes_map(codes_csv_path: Union[str, Path, object]) -> Tuple[Dict[str, str], List[str]]:
-    """Carica il file codes.csv con colonne: Category, Codes.
-
-    Accetta sia path che file-like (es. uploaded file in Streamlit).
-    """
+    """Carica il file codes.csv con colonne: Category, Codes."""
     if not isinstance(codes_csv_path, (str, Path)):
-        # file-like object (es. streamlit upload)
         df = pd.read_csv(codes_csv_path, dtype=str).fillna("")
     else:
         df = pd.read_csv(codes_csv_path, dtype=str).fillna("")
@@ -293,7 +261,6 @@ def map_turni_to_category(df: pd.DataFrame, code_to_cat: Dict[str, str]) -> pd.D
                 return (t, codes_upper[t_up])
         return (None, None)
 
-    # Assicuriamoci che Turno_tokens esista
     if "Turno_tokens" not in df.columns:
         df["Turno_tokens"] = [[] for _ in range(len(df))]
 
@@ -308,7 +275,7 @@ def map_turni_to_category(df: pd.DataFrame, code_to_cat: Dict[str, str]) -> pd.D
 # ============================================================
 
 def build_date_representation(data_raw: Union[str, int], month: Optional[int] = None, year: Optional[int] = None) -> str:
-    """Costruisce una data leggibile (es. 05/11/2025) dal numero giorno."""
+    """Costruisce una data leggibile dal numero giorno."""
     try:
         day = int(str(data_raw).strip())
         if month and year:
@@ -322,23 +289,19 @@ def build_date_representation(data_raw: Union[str, int], month: Optional[int] = 
 def process_workbook(
     uploaded_file: Union[bytes, Path, object],
     code_to_cat: Dict[str, str],
-    infer_month: bool = False,     # parametro mantenuto per compatibilità ma non usato internamente
+    infer_month: bool = False,
     month_for_days: int | None = None,
     year_for_days: int | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
-    """Flusso principale di elaborazione Conerobus.
-    Restituisce (grouped_df, df_valid, month_string)
-    """
+    """Flusso principale di elaborazione Conerobus."""
     raw_df, _ = _read_xls_try_header(uploaded_file)
     df = normalize_conerobus_df(raw_df)
     df = map_turni_to_category(df, code_to_cat)
 
-    # Data leggibile dal numero giorno + mese/anno forniti
     df["Data_repr"] = df["Data_raw"].apply(
         lambda v: build_date_representation(v, month_for_days, year_for_days)
     )
 
-    # (opzionale) una Data_parsed, utile per ordinamenti cronologici in app.py
     def _to_ts(v):
         try:
             d = int(str(v).strip())
@@ -350,7 +313,6 @@ def process_workbook(
 
     df["Data_parsed"] = df["Data_raw"].apply(_to_ts)
 
-    # Filtra solo righe con categoria mappata
     df_valid = df[df["Category"].notnull() & df["Category"].astype(bool)].copy()
     if df_valid.empty:
         grouped = pd.DataFrame(
@@ -360,7 +322,6 @@ def process_workbook(
 
     df_valid["Nr"] = 1
 
-    # se manca la colonna Qualifica, la aggiungiamo vuota per compatibilità con app.py
     if "Qualifica" not in df_valid.columns:
         df_valid["Qualifica"] = ""
 
