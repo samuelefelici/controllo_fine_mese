@@ -46,7 +46,6 @@ def _detect_encoding_and_try_csv(raw_bytes: bytes) -> Tuple[Optional[pd.DataFram
         for d in delims:
             try:
                 df = pd.read_csv(StringIO(text), sep=d, header=0, dtype=str)
-                # consideriamo valido se ci sono almeno 2 colonne
                 if df.shape[1] > 1:
                     return df, enc, d
             except Exception:
@@ -84,7 +83,7 @@ def _read_xls_try_header(uploaded_file: Union[bytes, Path, object], max_header_r
     filename = getattr(uploaded_file, "name", "") or str(uploaded_file)
     ext = Path(filename).suffix.lower()
 
-    keywords = {"mat", "matricola", "cognome", "nome", "turno", "turnoe", "giorno", "data"}
+    keywords = {"mat", "matricola", "cognome", "nome", "turno", "turnoe", "giorno", "data", "residenza"}
 
     # Se è Excel (xlsx/xls) proviamo a cercare la riga header contenente keyword
     if ext in (".xls", ".xlsx"):
@@ -144,19 +143,45 @@ def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
 
     Questa versione non si basa esclusivamente sugli indici di colonna: cerca
     le colonne per parole chiave e usa indici di fallback quando necessario.
+    Gestisce anche colonne vuote iniziali (es. 5 colonne vuote).
     """
     df = df.copy()
     df = df.dropna(how="all")
     if df.empty:
         return df
 
-    # Trova colonne usando keyword matching con fallback agli indici originari
-    mat_col = _find_col_by_keywords(df, ["mat", "matricola"], fallback_index=1)
-    cognome_col = _find_col_by_keywords(df, ["cognome", "surname"], fallback_index=2)
-    nome_col = _find_col_by_keywords(df, ["nome", "name"], fallback_index=3)
-    data_col = _find_col_by_keywords(df, ["data", "giorno"], fallback_index=4)  # E in origine era index 4 (colonna E)
-    giorno_col = _find_col_by_keywords(df, ["tipo", "giorno", "gg", "giorn"], fallback_index=5)
-    turno_col = _find_col_by_keywords(df, ["turno", "turnoe", "mattina", "sera"], fallback_index=12)  # M = 12 (0-based)
+    # Indici attesi originali (0-based) dalla versione Conerobus
+    expected_indices = {
+        "Mat": 1,
+        "Cognome": 2,
+        "Nome": 3,
+        "Data_raw": 5,
+        "Giorno": 6,
+        "TurnoE": 12,
+    }
+
+    # Se esiste una colonna con nome 'mat' o 'matricola', usiamola per rilevare eventuale offset
+    lowered = [str(c).strip().lower() for c in df.columns]
+    found_mat_idx = None
+    for i, name in enumerate(lowered):
+        if "mat" in name or "matricola" in name:
+            found_mat_idx = i
+            break
+
+    offset = 0
+    if found_mat_idx is not None:
+        offset = found_mat_idx - expected_indices["Mat"]
+        # non permettiamo offset negativo automatico
+        if offset < 0:
+            offset = 0
+
+    # Proviamo a trovare colonne per keyword, passando fallback indicizzato corretto (applicando offset)
+    mat_col = _find_col_by_keywords(df, ["mat", "matricola"], fallback_index=expected_indices["Mat"] + offset)
+    cognome_col = _find_col_by_keywords(df, ["cognome", "surname", "cognome"], fallback_index=expected_indices["Cognome"] + offset)
+    nome_col = _find_col_by_keywords(df, ["nome", "name"], fallback_index=expected_indices["Nome"] + offset)
+    data_col = _find_col_by_keywords(df, ["data", "giorno", "day"], fallback_index=expected_indices["Data_raw"] + offset)
+    giorno_col = _find_col_by_keywords(df, ["tipo", "giorno", "gg", "giorn"], fallback_index=expected_indices["Giorno"] + offset)
+    turno_col = _find_col_by_keywords(df, ["turno", "turnoe", "turnoE", "codice"], fallback_index=expected_indices["TurnoE"] + offset)
 
     col_map = {}
     if mat_col is not None:
@@ -171,27 +196,6 @@ def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
         col_map[giorno_col] = "Giorno"
     if turno_col is not None:
         col_map[turno_col] = "TurnoE"
-
-    # Se non abbiamo trovato nulla, proviamo la mappatura basata sugli indici originali
-    # (manteniamo la compatibilità con la versione precedente)
-    try:
-        if not col_map.get("Mat") and len(df.columns) > 1:
-            col_map[df.columns[1]] = "Mat"
-        if not col_map.get("Cognome") and len(df.columns) > 2:
-            col_map[df.columns[2]] = "Cognome"
-        if not col_map.get("Nome") and len(df.columns) > 3:
-            col_map[df.columns[3]] = "Nome"
-        # originalmente Data_raw era df.columns[5] (0-based 5 = colonna F), ma nei file reali
-        # spesso Data/Giorno sono nelle colonne 4/5; proviamo a essere tolleranti:
-        if not col_map.get("Data_raw") and len(df.columns) > 4:
-            col_map[df.columns[4]] = "Data_raw"
-        if not col_map.get("Giorno") and len(df.columns) > 5:
-            col_map[df.columns[5]] = "Giorno"
-        if not col_map.get("TurnoE") and len(df.columns) > 12:
-            col_map[df.columns[12]] = "TurnoE"
-    except Exception:
-        # In caso di qualsiasi problema, proseguiamo comunque e aggiungiamo colonne vuote più avanti
-        warnings.warn("Problema durante la creazione mappatura colonne: alcune colonne potrebbero mancare.")
 
     # Rinominazione (se col_map è vuoto non farà nulla)
     if col_map:
@@ -213,8 +217,12 @@ def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
     df["Giorno"] = df["Giorno"].astype(str).str.strip().str.capitalize().replace("Nan", "")
 
     # Data (giorno numerico) - estraiamo il primo numero nella cella
-    df["Data_raw"] = df["Data_raw"].astype(str).apply(lambda v: (re.search(r"(\d+)", v) or re.match(r"$", "")).group(1) if re.search(r"(\d+)", v) else "")
-    df["Data_raw"] = df["Data_raw"].fillna("").astype(str)
+    def _extract_first_number(v):
+        s = str(v)
+        m = re.search(r"(\d+)", s)
+        return m.group(1) if m else ""
+
+    df["Data_raw"] = df["Data_raw"].apply(_extract_first_number).fillna("").astype(str)
 
     # Turno
     df["Turno_raw"] = df["TurnoE"].astype(str).fillna("").str.strip().replace("nan", "")
