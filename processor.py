@@ -201,12 +201,19 @@ def process_workbook(
         return pd.NaT
     df["Data_parsed"] = df["Data_raw"].apply(_to_ts)
 
-    # Filtra solo righe con categoria mappata
+       # Filtra solo righe con categoria mappata
     df_valid = df[df["Category"].notnull()].copy()
     if df_valid.empty:
-        return pd.DataFrame(), pd.DataFrame(), None
+        grouped = pd.DataFrame(
+            columns=["Category", "Mat", "Cognome", "Nome", "Qualifica", "Dates", "DaysCount", "RawTurns"]
+        )
+        return grouped, df_valid, None
 
     df_valid["Nr"] = 1
+
+    # se manca la colonna Qualifica, la aggiungiamo vuota per compatibilità con app.py
+    if "Qualifica" not in df_valid.columns:
+        df_valid["Qualifica"] = ""
 
     def dates_agg(x):
         vals = [v for v in x.dropna().unique() if str(v).strip()]
@@ -214,7 +221,7 @@ def process_workbook(
 
     grouped = (
         df_valid
-        .groupby(["Category", "Mat", "Cognome", "Nome"], sort=False)
+        .groupby(["Category", "Mat", "Cognome", "Nome", "Qualifica"], sort=False)
         .agg(
             Dates=("Data_repr", dates_agg),
             DaysCount=("Data_repr", "nunique"),
@@ -223,7 +230,6 @@ def process_workbook(
         .reset_index()
     )
 
-    # Non inferiamo più il mese: lasciamo None e lo gestisce app.py
     month_string = None
     return grouped, df_valid, month_string
 
