@@ -135,6 +135,15 @@ def _detect_encoding_and_try_csv_preferring_tab(raw_bytes):
 
 
 def _read_flexible_excel_or_text(uploaded_file, header=0, prefer_header_detection=True):
+    """
+    Legge file Excel/CSV/TXT/HTML rispettando il parametro 'header':
+      - header=0   -> forza presenza header (prima riga è intestazione)
+      - header=None -> forza assenza header
+    Se prefer_header_detection=True e header=0 sui file di testo,
+    prova a rilevare automaticamente la presenza dell'header.
+    Ritorna: (df, had_header: bool)
+    """
+    # Leggi raw bytes
     if hasattr(uploaded_file, "read"):
         raw = uploaded_file.read()
         try:
@@ -147,46 +156,71 @@ def _read_flexible_excel_or_text(uploaded_file, header=0, prefer_header_detectio
     filename = getattr(uploaded_file, "name", None)
     ext = Path(filename).suffix.lower() if filename else ""
 
-    # xlsx zip
+    # ---- Excel (xlsx dentro zip)
     try:
         import zipfile
         if zipfile.is_zipfile(BytesIO(raw)):
-            df = _try_read_excel_bytes(raw, engine="openpyxl")
-            if df is not None:
-                return df, True
+            df = pd.read_excel(BytesIO(raw), header=header, engine="openpyxl")
+            return df, (header == 0)
     except Exception:
         pass
 
-    # prefer text parsing for txt/csv
+    # ---- File di testo (csv/txt)
     if ext in (".txt", ".csv"):
-        df, enc, delim, has_header = _detect_encoding_and_try_csv_preferring_tab(raw)
-        if df is not None:
-            return df, True if has_header else False
+        # prova a rilevare encoding + delimitatore
+        df_detect, enc, delim, has_header = _detect_encoding_and_try_csv_preferring_tab(raw)
+        if df_detect is not None:
+            text = raw.decode(enc) if isinstance(raw, (bytes, bytearray)) else str(raw)
+            # Se forziamo no-header, ignoriamo l'auto-detection
+            if header is None:
+                df = pd.read_csv(StringIO(text), sep=delim, header=None, engine="python")
+                return df, False
+            # Se vogliamo header e concediamo detection, usiamo has_header
+            if header == 0 and prefer_header_detection:
+                df = pd.read_csv(StringIO(text), sep=delim, header=(0 if has_header else None), engine="python")
+                return df, bool(has_header)
+            # Altrimenti forziamo header=0
+            df = pd.read_csv(StringIO(text), sep=delim, header=0, engine="python")
+            return df, True
 
-    # try excel engines
+    # ---- Excel .xls
     if ext == ".xls":
-        df = _try_read_excel_bytes(raw, engine="xlrd")
-        if df is not None:
-            return df, True
-    if ext == ".xlsx":
-        df = _try_read_excel_bytes(raw, engine="openpyxl")
-        if df is not None:
-            return df, True
+        try:
+            df = pd.read_excel(BytesIO(raw), header=header, engine="xlrd")
+            return df, (header == 0)
+        except Exception:
+            pass
 
+    # ---- Excel .xlsx
+    if ext == ".xlsx":
+        try:
+            df = pd.read_excel(BytesIO(raw), header=header, engine="openpyxl")
+            return df, (header == 0)
+        except Exception:
+            pass
+
+    # ---- Tentativi generici Excel
     for engine in ("openpyxl", "xlrd"):
         try:
-            df = _try_read_excel_bytes(raw, engine=engine)
-            if df is not None:
-                return df, True
+            df = pd.read_excel(BytesIO(raw), header=header, engine=engine)
+            return df, (header == 0)
         except Exception:
             continue
 
-    # general text attempt (in case .xls is actually a TSV)
-    df, enc, delim, has_header = _detect_encoding_and_try_csv_preferring_tab(raw)
-    if df is not None:
-        return df, True if has_header else False
+    # ---- Generico testo (fallback): prova con detection e poi forza header richiesto
+    df_detect, enc, delim, has_header = _detect_encoding_and_try_csv_preferring_tab(raw)
+    if df_detect is not None:
+        text = raw.decode(enc) if isinstance(raw, (bytes, bytearray)) else str(raw)
+        if header is None:
+            df = pd.read_csv(StringIO(text), sep=delim, header=None, engine="python")
+            return df, False
+        if header == 0 and prefer_header_detection:
+            df = pd.read_csv(StringIO(text), sep=delim, header=(0 if has_header else None), engine="python")
+            return df, bool(has_header)
+        df = pd.read_csv(StringIO(text), sep=delim, header=0, engine="python")
+        return df, True
 
-    # html fallback
+    # ---- HTML <table>
     try:
         text = None
         for enc in ("utf-8", "cp1252", "latin-1"):
@@ -196,9 +230,9 @@ def _read_flexible_excel_or_text(uploaded_file, header=0, prefer_header_detectio
             except Exception:
                 continue
         if text and ("<table" in text.lower() or "<html" in text.lower()):
-            tables = pd.read_html(StringIO(text))
+            tables = pd.read_html(StringIO(text), header=0 if header == 0 else None)
             if tables:
-                return tables[0], True
+                return tables[0], (header == 0)
     except Exception:
         pass
 
@@ -207,8 +241,7 @@ def _read_flexible_excel_or_text(uploaded_file, header=0, prefer_header_detectio
 
 def _read_xls_try_header(uploaded_file):
     df, had_header = _read_flexible_excel_or_text(uploaded_file, header=0)
-    return df
-
+    return df, had_header
 
 def _read_xls_no_header(uploaded_file):
     df, had_header = _read_flexible_excel_or_text(uploaded_file, header=None)
@@ -217,7 +250,8 @@ def _read_xls_no_header(uploaded_file):
     if df.shape[1] >= 8 and list(df.columns)[:8] == list(range(8)):
         df = df.iloc[:, :8]
         df.columns = ["Mat", "Cognome", "Nome", "Qualifica", "Data_raw", "Giorno", "Turno_raw", "Minuti"]
-    return df
+    return df, False
+
 
 
 def _has_expected_header_columns(df):
@@ -232,13 +266,14 @@ def _has_expected_header_columns(df):
 
 def read_input_table(uploaded_file):
     try:
-        df_head = _read_xls_try_header(uploaded_file)
+        df_head, had_header = _read_xls_try_header(uploaded_file)
         if _has_expected_header_columns(df_head):
             return df_head, True
     except Exception:
         pass
-    df_no_head = _read_xls_no_header(uploaded_file)
+    df_no_head, _ = _read_xls_no_header(uploaded_file)
     return df_no_head, False
+
 
 
 # -----------------------
