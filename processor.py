@@ -1,18 +1,3 @@
-"""
-processor.py - versione Conerobus (ottobre 2025) - AGGIORNATO
-
-Struttura file mensile Conerobus (NUOVA):
-- Colonna 0 = Residenza
-- Colonna 1 = Matricola
-- Colonna 2 = Cognome
-- Colonna 3 = Nome
-- Colonna 4 = Gruppo
-- Colonna 5 = Data (giorno numerico 1-31)
-- Colonna 6 = TurnoC
-- Colonna 7-10 = Altri campi TurnoC
-- Colonna 11 = TurnoE (codice turno che ci interessa)
-"""
-
 import re
 import csv
 import warnings
