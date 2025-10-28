@@ -2,216 +2,194 @@ import streamlit as st
 import pandas as pd
 from io import StringIO, BytesIO
 from pathlib import Path
-from processor import process_workbook, to_pdf_bytes, load_codes_map
 import csv
 import warnings
+import tempfile
+import os
+from processor import process_workbook, load_codes_map
 
-# ================================================================
-# CONFIGURAZIONE BASE
-# ================================================================
-st.set_page_config(page_title="Controlli Fine Mese", layout="wide")
-st.title("Controlli Fine Mese - Anteprima grezza del file (robusta)")
+st.set_page_config(page_title="DEBUG - Controlli Fine Mese", layout="wide")
+st.title("DEBUG: Controlli Fine Mese - diagnostica lettura file")
 
-repo_root = Path(__file__).parent
-codes_file = repo_root / "codes.csv"
-
-st.markdown(
-    "Carica il file (.xls/.xlsx/.csv/.txt). "
-    "Questa vista prova a leggere il foglio 'così com'è' con più strategie tolleranti "
-    "e mostra diagnostica per capire righe malformate."
-)
-
-# ================================================================
-# FILE UPLOADER
-# ================================================================
-uploaded_file = st.file_uploader(
-    "Carica il file (.xls/.xlsx/.csv/.txt)",
-    type=["xls", "xlsx", "csv", "txt"],
-    accept_multiple_files=False
-)
-
+uploaded_file = st.file_uploader("Carica il file (.xls/.xlsx/.csv/.txt)", type=["xls", "xlsx", "csv", "txt"], accept_multiple_files=False)
 if uploaded_file is None:
     st.info("Carica un file per iniziare.")
     st.stop()
 
-# ================================================================
-# LETTURA GREZZA + STRATEGIE TOLLERANTI
-# ================================================================
-with st.spinner("Lettura e analisi file in corso..."):
-    # Leggiamo i bytes una volta sola
+try:
+    raw_bytes = uploaded_file.read()
+except Exception:
     try:
-        raw_bytes = uploaded_file.read()
-    except Exception:
-        try:
-            raw_bytes = uploaded_file.getvalue()
-        except Exception as e:
-            st.error(f"Impossibile leggere il file caricato: {e}")
-            st.stop()
-
-    df = None
-    detected_format = None
-    warnings_list = []
-
-    # 1) Proviamo pd.read_excel con openpyxl (xlsx) e header=None per visualizzare grezzo
-    try:
-        df = pd.read_excel(BytesIO(raw_bytes), header=None, engine="openpyxl", dtype=str)
-        detected_format = "excel_openpyxl_headerNone"
+        raw_bytes = uploaded_file.getvalue()
     except Exception as e:
-        warnings_list.append(f"openpyxl read failed: {e}")
-        df = None
+        st.error(f"Impossibile leggere il file caricato: {e}")
+        st.stop()
 
-    # 2) Se non funziona, fallback: usare openpyxl.load_workbook per leggere cella per cella (solo xlsx)
-    if df is None:
+st.write("Lunghezza bytes:", len(raw_bytes))
+
+# mostra prime bytes (hex) per riconoscere formato
+st.write("Prime 64 bytes (hex):", raw_bytes[:64].hex())
+
+# semplice riconoscimento "magic"
+magic = raw_bytes[:8]
+if magic.startswith(b'PK'):
+    st.write("Probabile ZIP container (xlsx o docx/pptx) -> formato XLSX probabile (PK..).")
+elif magic.startswith(b'\xd0\xcf\x11\xe0'):
+    st.write("Probabile file BIFF (vecchio .xls).")
+else:
+    # check se è testo
+    try:
+        raw_bytes.decode("utf-8")
+        st.write("Sembra testo UTF-8 (potrebbe essere CSV/TXT).")
+    except Exception:
+        st.write("Non è chiaro il formato dai primi bytes.")
+
+# salvo temporaneamente il file su disco per testare come file path
+suffix = ".bin"
+if raw_bytes[:2] == b'PK':
+    suffix = ".xlsx"
+elif raw_bytes[:4] == b'\xd0\xcf\x11\xe0':
+    suffix = ".xls"
+else:
+    # proviamo csv
+    suffix = ".csv"
+
+tmp_dir = Path(tempfile.gettempdir())
+tmp_path = tmp_dir / f"tmp_upload_debug{suffix}"
+tmp_path.write_bytes(raw_bytes)
+st.write("Saved tmp file to:", str(tmp_path))
+
+# Provo pandas.read_excel / read_csv su tmp file
+st.header("Tentativi di lettura con pandas/openpyxl/csv")
+read_results = {}
+
+# 1) proviamo pd.read_excel (openpyxl) se xlsx
+if suffix == ".xlsx" or suffix == ".xls":
+    try:
+        df = pd.read_excel(tmp_path, header=None, engine="openpyxl", dtype=str)
+        read_results["pandas_openpyxl_headerNone"] = {"shape": df.shape, "head": df.head(5).astype(str).values.tolist()}
+    except Exception as e:
+        read_results["pandas_openpyxl_headerNone_error"] = repr(e)
+
+    # anche con engine automatico senza dtype forzato
+    try:
+        df2 = pd.read_excel(tmp_path, header=None)
+        read_results["pandas_readexcel_headerNone_auto"] = {"shape": df2.shape, "head": df2.head(5).astype(str).values.tolist()}
+    except Exception as e:
+        read_results["pandas_readexcel_error"] = repr(e)
+
+# 2) proviamo a leggere come CSV/TXT
+try:
+    text = None
+    try:
+        text = raw_bytes.decode("utf-8")
+        enc = "utf-8"
+    except UnicodeDecodeError:
+        text = raw_bytes.decode("latin-1", errors="replace")
+        enc = "latin-1"
+    st.write("Decodifica effettuata con:", enc)
+    # sniff delimiter
+    try:
+        sample = "\n".join(text.splitlines()[:20])
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(sample)
+        st.write("Sniffer CSV delimiter:", dialect.delimiter)
+        df_csv = pd.read_csv(StringIO(text), sep=dialect.delimiter, header=None, dtype=str, engine="python", on_bad_lines="warn")
+        read_results["pd_read_csv_sniff"] = {"shape": df_csv.shape, "head": df_csv.head(5).astype(str).values.tolist()}
+    except Exception as e:
+        read_results["pd_read_csv_sniff_error"] = repr(e)
+        # fallback: try common sep
+        for sep in ["\t", ";", ",", "|"]:
+            try:
+                df_try = pd.read_csv(StringIO(text), sep=sep, header=None, dtype=str, engine="python", on_bad_lines="warn")
+                read_results[f"pd_read_csv_sep_{sep}"] = {"shape": df_try.shape, "head": df_try.head(5).astype(str).values.tolist()}
+            except Exception as e2:
+                read_results[f"pd_read_csv_sep_{sep}_error"] = repr(e2)
+except Exception as e:
+    read_results["csv_decode_error"] = repr(e)
+
+# 3) openpyxl inspection (se xlsx)
+if suffix == ".xlsx":
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(filename=str(tmp_path), read_only=True, data_only=True)
+        sheetnames = wb.sheetnames
+        st.write("openpyxl wb.sheetnames:", sheetnames)
+        ws = wb.active
+        st.write("active sheet:", ws.title, " max_row:", ws.max_row, " max_column:", ws.max_column)
+        sample_rows = []
+        for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            sample_rows.append([("" if v is None else str(v)) for v in row])
+            if i >= 6:
+                break
+        read_results["openpyxl_active_head"] = sample_rows
+    except Exception as e:
+        read_results["openpyxl_error"] = repr(e)
+
+st.write(read_results)
+
+# Mostriamo anche info sul DataFrame 'df' se esiste dal parsing principale
+st.header("Controlli sul DataFrame creato dal parsing principale (se presente)")
+try:
+    # ricreiamo il parsing come fai nel tuo app per essere coincidenti
+    df_main = None
+    try:
+        df_main = pd.read_excel(BytesIO(raw_bytes), header=None, engine="openpyxl", dtype=str)
+    except Exception:
+        df_main = None
+    if df_main is None:
         try:
+            # prova openpyxl manual
             from openpyxl import load_workbook
-            wb = load_workbook(filename=BytesIO(raw_bytes), read_only=True, data_only=True)
-            ws = wb.active
+            wb2 = load_workbook(filename=BytesIO(raw_bytes), read_only=True, data_only=True)
+            ws2 = wb2.active
             rows = []
             maxcols = 0
-            for row in ws.iter_rows(values_only=True):
+            for row in ws2.iter_rows(values_only=True):
                 r = ["" if v is None else str(v) for v in row]
                 rows.append(r)
                 if len(r) > maxcols:
                     maxcols = len(r)
-            # pad rows
             norm = [r + [""] * (maxcols - len(r)) for r in rows]
-            df = pd.DataFrame(norm).astype(str)
-            detected_format = "excel_openpyxl_manual_rows"
-        except Exception as e:
-            warnings_list.append(f"openpyxl load_workbook failed: {e}")
-            df = None
+            df_main = pd.DataFrame(norm).astype(str)
+        except Exception:
+            df_main = None
+    if df_main is not None:
+        st.write("df_main.shape:", df_main.shape)
+        st.write("Prime 10 righe (testo):")
+        for r in df_main.head(10).astype(str).values.tolist():
+            st.text(" | ".join(r))
+        # statistiche semplici
+        st.write("Conteggio valori vuoti per colonna (stringhe vuote):")
+        empties = (df_main == "").sum(axis=0).to_dict()
+        st.write(empties)
+    else:
+        st.write("df_main è None dopo i tentativi di parsing come nel tuo app.")
+except Exception as e:
+    st.write("Errore in controllo df_main:", repr(e))
 
-    # 3) Se ancora nulla, proviamo pd.read_excel con xlrd (per .xls storici)
-    if df is None:
-        try:
-            df = pd.read_excel(BytesIO(raw_bytes), header=None, engine="xlrd", dtype=str)
-            detected_format = "excel_xlrd_headerNone"
-        except Exception as e:
-            warnings_list.append(f"xlrd read failed: {e}")
-            df = None
+# Ora proviamo a chiamare process_workbook in due modi (file-like e path) e segnaliamo forma dei risultati
+st.header("Chiamata a process_workbook (debug)")
 
-    # 4) Se non è Excel o i precedenti falliscono, proviamo parsing testo/CSV con engine='python' (tollerante)
-    if df is None:
-        try:
-            try:
-                text = raw_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                text = raw_bytes.decode("latin-1", errors="replace")
+codes_file = Path(__file__).parent / "codes.csv"
+codes_map = load_codes_map(codes_file)[0] if codes_file.exists() else {}
 
-            # Tentiamo prima pd.read_csv con engine='python' e sep=None (autodetect), on_bad_lines='warn'
-            try:
-                df = pd.read_csv(StringIO(text), sep=None, engine="python", header=None, dtype=str, on_bad_lines="warn")
-                detected_format = "csv_python_sepNone_on_bad_lines_warn"
-            except Exception as e:
-                warnings_list.append(f"pd.read_csv python sep=None failed: {e}")
-                df = None
+# 1) file-like (BytesIO) - quello che usi ora
+try:
+    bio = BytesIO(raw_bytes)
+    bio.seek(0)
+    res = process_workbook(bio, codes_map, infer_month=True, month_for_days=None, year_for_days=None)
+    st.write("process_workbook(file-like) risultato type/len:", type(res), None if res is None else [type(x) for x in res])
+    st.write("process_workbook(file-like) raw repr (prima 2000 chars):", repr(res)[:2000])
+except Exception as e:
+    st.write("process_workbook(file-like) errore:", repr(e))
 
-            # 5) se ancora nulla, proviamo separatori espliciti con engine='python' e on_bad_lines='skip'
-            if df is None:
-                for sep in ["\t", ";", ",", "|"]:
-                    try:
-                        df = pd.read_csv(StringIO(text), sep=sep, engine="python", header=None, dtype=str, on_bad_lines="warn")
-                        detected_format = f"csv_python_sep_{sep}_on_bad_lines_warn"
-                        break
-                    except Exception as e:
-                        warnings_list.append(f"pd.read_csv python sep={sep} failed: {e}")
-                        df = None
+# 2) passiamo il tmp path (alcune funzioni richiedono path)
+try:
+    res2 = process_workbook(str(tmp_path), codes_map, infer_month=True, month_for_days=None, year_for_days=None)
+    st.write("process_workbook(path) risultato type/len:", type(res2), None if res2 is None else [type(x) for x in res2])
+    st.write("process_workbook(path) raw repr (prima 2000 chars):", repr(res2)[:2000])
+except Exception as e:
+    st.write("process_workbook(path) errore:", repr(e))
 
-            # 6) fallback manuale riga-per-riga con csv.reader provando diversi separatori
-            if df is None:
-                lines = text.splitlines()
-                rows = []
-                problem_lines = []
-                maxcols = 0
-                for i, line in enumerate(lines, start=1):
-                    parsed = None
-                    for sep in [";", "\t", ",", "|"]:
-                        try:
-                            parsed = next(csv.reader([line], delimiter=sep))
-                            # accept parsed if at least 2 columns
-                            if len(parsed) >= 1:
-                                break
-                        except Exception:
-                            parsed = None
-                    if parsed is None:
-                        problem_lines.append((i, line))
-                        parsed = [line]
-                    rows.append(parsed)
-                    if len(parsed) > maxcols:
-                        maxcols = len(parsed)
-                # pad rows to maxcols
-                norm_rows = [r + [""] * (maxcols - len(r)) for r in rows]
-                df = pd.DataFrame(norm_rows).astype(str)
-                detected_format = "manual_csv_guess"
-                if problem_lines:
-                    warnings_list.append(f"Manual parsing detected {len(problem_lines)} problematic lines (first 10 shown).")
-        except Exception as e:
-            st.error(f"Impossibile interpretare il file come Excel o CSV/TXT: {e}")
-            st.stop()
-
-    # Normalizziamo i NaN a stringa vuota per una visualizzazione pulita
-    df = df.fillna("")
-
-st.success(f"Caricato con: {detected_format}")
-if warnings_list:
-    st.warning("Avvisi lettura:")
-    for w in warnings_list[:20]:
-        st.text(w)
-
-st.write("✅ Anteprima grezza (prime 20 righe, header NON interpretato):")
-st.dataframe(df.head(20), use_container_width=True)
-
-st.write("Informazioni grezze:")
-st.write(f"Dimensione DataFrame: {df.shape[0]} righe × {df.shape[1]} colonne")
-st.write("Colonne (index così come pandas le riporta):")
-for i, c in enumerate(df.columns):
-    st.write(f"{i}: {c!s}")
-
-st.write("Prime 20 righe (visualizzazione testuale):")
-rows_preview = df.head(20).astype(str).values.tolist()
-for r in rows_preview:
-    st.text(" | ".join(r))
-
-st.markdown("---")
-st.info("Se le intestazioni sono in una riga interna, indica qui quale riga usare come header (es. 0 per prima riga, 5 per sesta), o premi il pulsante per procedere con l'elaborazione grezza.")
-
-# CONTROLLO: input riga header da usare
-header_row_input = st.number_input("Riga da usare come header (opzionale, -1 = nessuna)", min_value=-1, max_value=max(0, df.shape[0]-1), value=-1, step=1)
-use_header = None if header_row_input < 0 else int(header_row_input)
-
-if st.button("Mostra anteprima interpretata con la riga di header scelta"):
-    try:
-        if use_header is None:
-            st.error("Nessuna riga di header scelta.")
-        else:
-            # ricreiamo un DataFrame interpretando la riga scelta come header
-            header_vals = list(df.iloc[use_header].astype(str).tolist())
-            df_interp = df.copy()
-            df_interp.columns = [f"col_{i}" for i in range(df.shape[1])]
-            df_interp = df_interp.drop(index=use_header).reset_index(drop=True)
-            df_interp.columns = header_vals
-            st.write(f"Anteprima interpretata usando la riga {use_header} come header:")
-            st.dataframe(df_interp.head(40), use_container_width=True)
-    except Exception as e:
-        st.error(f"Errore interpretazione header: {e}")
-
-# Opzione: procedere con l'elaborazione normale usando il BytesIO originale
-if st.button("Procedi con l'elaborazione (usando il file caricato)"):
-    with st.spinner("Elaborazione in corso..."):
-        try:
-            file_for_processing = BytesIO(raw_bytes)
-            file_for_processing.seek(0)
-            grouped_df, df_valid, inferred_month_str = process_workbook(
-                file_for_processing,
-                load_codes_map(codes_file)[0] if codes_file.exists() else {},
-                infer_month=True,
-                month_for_days=None,
-                year_for_days=None
-            )
-            st.success("Elaborazione completata.")
-            st.subheader("Anteprima riepilogo (aggregato)")
-            st.dataframe(grouped_df, use_container_width=True)
-            st.subheader("Dati validi (anteprima)")
-            st.dataframe(df_valid.head(200), use_container_width=True)
-        except Exception as e:
-            st.error(f"Errore durante l'elaborazione: {e}")
+st.success("DEBUG completato. Incolla qui i risultati principali (detected_format / warnings / shapes / error logs) per proseguire.")
