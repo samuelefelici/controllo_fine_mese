@@ -84,8 +84,8 @@ def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
         df.columns[1]: "Mat",
         df.columns[2]: "Cognome",
         df.columns[3]: "Nome",
-        df.columns[4]: "Data_raw",
-        df.columns[5]: "Giorno",
+        df.columns[5]: "Data_raw",
+        df.columns[6]: "Giorno",
         df.columns[12]: "TurnoE",  # colonna M (13°)
     }
     df = df.rename(columns=col_map)
