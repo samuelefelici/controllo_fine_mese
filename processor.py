@@ -10,17 +10,19 @@ Specifico per i file mensili Conerobus:
 - Colonna M = TurnoE (codice turno)
 
 Gestione semplificata e robusta:
-- Lettura automatica CSV/XLS
-- Normalizzazione basata su struttura fissa
+- Lettura automatica CSV/XLS con ricerca riga header
+- Normalizzazione tollerante basata su riconoscimento colonne
 - Mapping codici → categorie tramite codes.csv
 - Aggregazione e generazione PDF
 """
 
 import re
 import csv
+import warnings
 from io import BytesIO, StringIO
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Tuple, Dict, List, Union
 
 import pandas as pd
 
@@ -29,37 +31,82 @@ import pandas as pd
 # LETTURA FILE (Excel o CSV)
 # ============================================================
 
-def _detect_encoding_and_try_csv(raw_bytes):
+def _detect_encoding_and_try_csv(raw_bytes: bytes) -> Tuple[Optional[pd.DataFrame], Optional[str], Optional[str]]:
+    """Prova alcune codifiche e separatori comuni e ritorna il DataFrame se valido."""
     encodings = ["utf-8", "cp1252", "latin-1"]
+    delims = ["\t", ";", ","]
+
     for enc in encodings:
         try:
             text = raw_bytes.decode(enc)
-            df = pd.read_csv(StringIO(text), sep="\t", header=0)
-            if df.shape[1] > 1:
-                return df, enc, "\t"
         except Exception:
             continue
-    return None, None, None
 
+        # proviamo diversi separatori
+        for d in delims:
+            try:
+                df = pd.read_csv(StringIO(text), sep=d, header=0, dtype=str)
+                # consideriamo valido se ci sono almeno 2 colonne
+                if df.shape[1] > 1:
+                    return df, enc, d
+            except Exception:
+                continue
 
-def _read_xls_try_header(uploaded_file):
-    """Legge un file Excel o CSV/TXT restituendo un DataFrame pandas."""
-    if hasattr(uploaded_file, "read"):
-        raw = uploaded_file.read()
-        uploaded_file.seek(0)
-    else:
-        raw = Path(uploaded_file).read_bytes()
-
-    filename = getattr(uploaded_file, "name", "")
-    ext = Path(filename).suffix.lower()
-
-    if ext in (".xls", ".xlsx"):
+        # fallback: usare csv.Sniffer per provare a indovinare il separatore
         try:
-            df = pd.read_excel(BytesIO(raw), header=0)
-            return df, True
+            sniffer = csv.Sniffer()
+            dialect = sniffer.sniff(text[:4096])
+            sep = dialect.delimiter
+            df = pd.read_csv(StringIO(text), sep=sep, header=0, dtype=str)
+            if df.shape[1] > 1:
+                return df, enc, sep
         except Exception:
             pass
 
+    return None, None, None
+
+
+def _read_xls_try_header(uploaded_file: Union[bytes, Path, object], max_header_row_search: int = 10) -> Tuple[pd.DataFrame, bool]:
+    """Legge un file Excel o CSV/TXT cercando automaticamente la riga di header.
+
+    Prova header=0..max_header_row_search-1 e sceglie la riga che contiene parole chiave tipiche.
+    Restituisce (DataFrame, True) se lettura avvenuta con successo.
+    """
+    if hasattr(uploaded_file, "read"):
+        raw = uploaded_file.read()
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+    else:
+        raw = Path(uploaded_file).read_bytes()
+
+    filename = getattr(uploaded_file, "name", "") or str(uploaded_file)
+    ext = Path(filename).suffix.lower()
+
+    keywords = {"mat", "matricola", "cognome", "nome", "turno", "turnoe", "giorno", "data"}
+
+    # Se è Excel (xlsx/xls) proviamo a cercare la riga header contenente keyword
+    if ext in (".xls", ".xlsx"):
+        for header_row in range(0, max_header_row_search):
+            try:
+                # dtype=str per evitare conversioni strane che alterano i nomi colonne
+                df_try = pd.read_excel(BytesIO(raw), header=header_row, dtype=str)
+                cols_text = " ".join([str(c).lower() for c in df_try.columns])
+                if any(k in cols_text for k in keywords):
+                    return df_try, True
+            except Exception:
+                # ignora e prova la riga successiva
+                continue
+        # fallback: prova a leggere comunque con header=0
+        try:
+            df = pd.read_excel(BytesIO(raw), header=0, dtype=str)
+            return df, True
+        except Exception:
+            # non è un excel leggibile, continueremo con rilevamento CSV/TXT
+            pass
+
+    # Proviamo come CSV/TXT / file di testo con rilevamento di encoding e separatore
     df_detect, enc, delim = _detect_encoding_and_try_csv(raw)
     if df_detect is not None:
         return df_detect, True
@@ -68,7 +115,25 @@ def _read_xls_try_header(uploaded_file):
 
 
 # ============================================================
-# NORMALIZZAZIONE (struttura fissa Conerobus)
+# UTILI PER MAPPATURA COLONNE
+# ============================================================
+
+def _find_col_by_keywords(df: pd.DataFrame, keywords: List[str], fallback_index: Optional[int] = None) -> Optional[str]:
+    """Cerca una colonna il cui nome contiene una delle keywords (case-insensitive).
+    Se non trova nulla, ritorna la colonna alla posizione fallback_index se valida, altrimenti None.
+    """
+    lowered = [str(c).lower() for c in df.columns]
+    for i, name in enumerate(lowered):
+        for kw in keywords:
+            if kw in name:
+                return df.columns[i]
+    if fallback_index is not None and 0 <= fallback_index < len(df.columns):
+        return df.columns[fallback_index]
+    return None
+
+
+# ============================================================
+# NORMALIZZAZIONE (struttura fissa Conerobus) - più robusta
 # ============================================================
 
 def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -76,62 +141,114 @@ def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
     Normalizza il file mensile Conerobus con struttura fissa:
     B=Matricola, C=Cognome, D=Nome, E=Data (giorno numerico),
     F=Tipo giorno (Lun, Mar...), M=TurnoE (codice turno).
+
+    Questa versione non si basa esclusivamente sugli indici di colonna: cerca
+    le colonne per parole chiave e usa indici di fallback quando necessario.
     """
     df = df.copy()
     df = df.dropna(how="all")
+    if df.empty:
+        return df
 
-    col_map = {
-        df.columns[1]: "Mat",
-        df.columns[2]: "Cognome",
-        df.columns[3]: "Nome",
-        df.columns[5]: "Data_raw",
-        df.columns[6]: "Giorno",
-        df.columns[12]: "TurnoE",  # colonna M (13°)
-    }
-    df = df.rename(columns=col_map)
+    # Trova colonne usando keyword matching con fallback agli indici originari
+    mat_col = _find_col_by_keywords(df, ["mat", "matricola"], fallback_index=1)
+    cognome_col = _find_col_by_keywords(df, ["cognome", "surname"], fallback_index=2)
+    nome_col = _find_col_by_keywords(df, ["nome", "name"], fallback_index=3)
+    data_col = _find_col_by_keywords(df, ["data", "giorno"], fallback_index=4)  # E in origine era index 4 (colonna E)
+    giorno_col = _find_col_by_keywords(df, ["tipo", "giorno", "gg", "giorn"], fallback_index=5)
+    turno_col = _find_col_by_keywords(df, ["turno", "turnoe", "mattina", "sera"], fallback_index=12)  # M = 12 (0-based)
+
+    col_map = {}
+    if mat_col is not None:
+        col_map[mat_col] = "Mat"
+    if cognome_col is not None:
+        col_map[cognome_col] = "Cognome"
+    if nome_col is not None:
+        col_map[nome_col] = "Nome"
+    if data_col is not None:
+        col_map[data_col] = "Data_raw"
+    if giorno_col is not None:
+        col_map[giorno_col] = "Giorno"
+    if turno_col is not None:
+        col_map[turno_col] = "TurnoE"
+
+    # Se non abbiamo trovato nulla, proviamo la mappatura basata sugli indici originali
+    # (manteniamo la compatibilità con la versione precedente)
+    try:
+        if not col_map.get("Mat") and len(df.columns) > 1:
+            col_map[df.columns[1]] = "Mat"
+        if not col_map.get("Cognome") and len(df.columns) > 2:
+            col_map[df.columns[2]] = "Cognome"
+        if not col_map.get("Nome") and len(df.columns) > 3:
+            col_map[df.columns[3]] = "Nome"
+        # originalmente Data_raw era df.columns[5] (0-based 5 = colonna F), ma nei file reali
+        # spesso Data/Giorno sono nelle colonne 4/5; proviamo a essere tolleranti:
+        if not col_map.get("Data_raw") and len(df.columns) > 4:
+            col_map[df.columns[4]] = "Data_raw"
+        if not col_map.get("Giorno") and len(df.columns) > 5:
+            col_map[df.columns[5]] = "Giorno"
+        if not col_map.get("TurnoE") and len(df.columns) > 12:
+            col_map[df.columns[12]] = "TurnoE"
+    except Exception:
+        # In caso di qualsiasi problema, proseguiamo comunque e aggiungiamo colonne vuote più avanti
+        warnings.warn("Problema durante la creazione mappatura colonne: alcune colonne potrebbero mancare.")
+
+    # Rinominazione (se col_map è vuoto non farà nulla)
+    if col_map:
+        df = df.rename(columns=col_map)
+
+    # Garantiamo l'esistenza delle colonne usate dal flusso
+    for required in ["Mat", "Cognome", "Nome", "Data_raw", "Giorno", "TurnoE"]:
+        if required not in df.columns:
+            df[required] = ""
 
     # Se manca la colonna "Qualifica", aggiungila vuota per compatibilità app.py
     if "Qualifica" not in df.columns:
         df["Qualifica"] = ""
 
-    # Pulizia base
-    df["Mat"] = df["Mat"].astype(str).str.strip()
-    df["Cognome"] = df["Cognome"].astype(str).str.strip().str.upper()
-    df["Nome"] = df["Nome"].astype(str).str.strip().str.upper()
-    df["Giorno"] = df["Giorno"].astype(str).str.strip().str.capitalize()
+    # Pulizia base, con protezioni
+    df["Mat"] = df["Mat"].astype(str).str.strip().replace("nan", "")
+    df["Cognome"] = df["Cognome"].astype(str).str.strip().str.upper().replace("NAN", "")
+    df["Nome"] = df["Nome"].astype(str).str.strip().str.upper().replace("NAN", "")
+    df["Giorno"] = df["Giorno"].astype(str).str.strip().str.capitalize().replace("Nan", "")
 
-    # Data (giorno numerico)
-    df["Data_raw"] = (
-        df["Data_raw"].astype(str).str.extract(r"(\d+)", expand=False).fillna("")
-    )
+    # Data (giorno numerico) - estraiamo il primo numero nella cella
+    df["Data_raw"] = df["Data_raw"].astype(str).apply(lambda v: (re.search(r"(\d+)", v) or re.match(r"$", "")).group(1) if re.search(r"(\d+)", v) else "")
+    df["Data_raw"] = df["Data_raw"].fillna("").astype(str)
 
     # Turno
-    df["Turno_raw"] = (
-        df["TurnoE"].astype(str).fillna("").str.strip().replace("nan", "")
-    )
+    df["Turno_raw"] = df["TurnoE"].astype(str).fillna("").str.strip().replace("nan", "")
 
-    # Tokenizzazione turno
-    df["Turno_tokens"] = df["Turno_raw"].apply(
-        lambda x: [t.strip() for t in str(x).split() if t.strip()]
-    )
+    # Tokenizzazione turno (lista di token)
+    def _tokenize_turno(x):
+        if x is None:
+            return []
+        s = str(x)
+        parts = [t.strip() for t in s.split() if t.strip()]
+        return parts
+
+    df["Turno_tokens"] = df["Turno_raw"].apply(_tokenize_turno)
 
     return df
-
 
 
 # ============================================================
 # MAPPATURA CODICI → CATEGORIE
 # ============================================================
 
-def load_codes_map(codes_csv_path):
-    """Carica il file codes.csv con colonne: Category, Codes"""
+def load_codes_map(codes_csv_path: Union[str, Path, object]) -> Tuple[Dict[str, str], List[str]]:
+    """Carica il file codes.csv con colonne: Category, Codes.
+
+    Accetta sia path che file-like (es. uploaded file in Streamlit).
+    """
     if not isinstance(codes_csv_path, (str, Path)):
+        # file-like object (es. streamlit upload)
         df = pd.read_csv(codes_csv_path, dtype=str).fillna("")
     else:
         df = pd.read_csv(codes_csv_path, dtype=str).fillna("")
 
-    code_to_cat = {}
-    categories_order = []
+    code_to_cat: Dict[str, str] = {}
+    categories_order: List[str] = []
     for _, row in df.iterrows():
         cat = str(row.get("Category", "")).strip()
         codes_field = str(row.get("Codes", "")).strip()
@@ -144,17 +261,21 @@ def load_codes_map(codes_csv_path):
     return code_to_cat, categories_order
 
 
-def map_turni_to_category(df: pd.DataFrame, code_to_cat: dict) -> pd.DataFrame:
+def map_turni_to_category(df: pd.DataFrame, code_to_cat: Dict[str, str]) -> pd.DataFrame:
     """Aggiunge colonne MatchedCode e Category al DataFrame."""
     df = df.copy()
     codes_upper = {k.upper(): v for k, v in code_to_cat.items()}
 
-    def find_mapping(tokens):
+    def find_mapping(tokens: List[str]) -> Tuple[Optional[str], Optional[str]]:
         for t in tokens:
             t_up = t.upper()
             if t_up in codes_upper:
                 return (t, codes_upper[t_up])
         return (None, None)
+
+    # Assicuriamoci che Turno_tokens esista
+    if "Turno_tokens" not in df.columns:
+        df["Turno_tokens"] = [[] for _ in range(len(df))]
 
     results = df["Turno_tokens"].apply(find_mapping)
     df["MatchedCode"] = [mc for mc, _ in results]
@@ -166,7 +287,7 @@ def map_turni_to_category(df: pd.DataFrame, code_to_cat: dict) -> pd.DataFrame:
 # COSTRUZIONE DATA E AGGREGAZIONE
 # ============================================================
 
-def build_date_representation(data_raw, month=None, year=None):
+def build_date_representation(data_raw: Union[str, int], month: Optional[int] = None, year: Optional[int] = None) -> str:
     """Costruisce una data leggibile (es. 05/11/2025) dal numero giorno."""
     try:
         day = int(str(data_raw).strip())
@@ -179,13 +300,15 @@ def build_date_representation(data_raw, month=None, year=None):
 
 
 def process_workbook(
-    uploaded_file,
-    code_to_cat,
-    infer_month: bool = False,     # <-- parametro reintrodotto e ignorato
+    uploaded_file: Union[bytes, Path, object],
+    code_to_cat: Dict[str, str],
+    infer_month: bool = False,     # parametro mantenuto per compatibilità ma non usato internamente
     month_for_days: int | None = None,
     year_for_days: int | None = None,
-):
-    """Flusso principale di elaborazione Conerobus."""
+) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
+    """Flusso principale di elaborazione Conerobus.
+    Restituisce (grouped_df, df_valid, month_string)
+    """
     raw_df, _ = _read_xls_try_header(uploaded_file)
     df = normalize_conerobus_df(raw_df)
     df = map_turni_to_category(df, code_to_cat)
@@ -204,10 +327,11 @@ def process_workbook(
         except Exception:
             pass
         return pd.NaT
+
     df["Data_parsed"] = df["Data_raw"].apply(_to_ts)
 
-       # Filtra solo righe con categoria mappata
-    df_valid = df[df["Category"].notnull()].copy()
+    # Filtra solo righe con categoria mappata
+    df_valid = df[df["Category"].notnull() & df["Category"].astype(bool)].copy()
     if df_valid.empty:
         grouped = pd.DataFrame(
             columns=["Category", "Mat", "Cognome", "Nome", "Qualifica", "Dates", "DaysCount", "RawTurns"]
@@ -239,12 +363,11 @@ def process_workbook(
     return grouped, df_valid, month_string
 
 
-
 # ============================================================
 # GENERAZIONE PDF
 # ============================================================
 
-def to_pdf_bytes(grouped_df, df_valid, month_string=""):
+def to_pdf_bytes(grouped_df: pd.DataFrame, df_valid: pd.DataFrame, month_string: str = "") -> bytes:
     """Crea un PDF riepilogativo per ogni categoria."""
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, PageBreak
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -278,8 +401,8 @@ def to_pdf_bytes(grouped_df, df_valid, month_string=""):
                 data = [["Mat", "Cognome", "Nome", "Data", "Giorno", "Turno"]]
                 for _, r in rows.iterrows():
                     data.append([
-                        r["Mat"], r["Cognome"], r["Nome"],
-                        r["Data_repr"], r["Giorno"], r["MatchedCode"] or r["Turno_raw"]
+                        r.get("Mat", ""), r.get("Cognome", ""), r.get("Nome", ""),
+                        r.get("Data_repr", ""), r.get("Giorno", ""), r.get("MatchedCode", "") or r.get("Turno_raw", "")
                     ])
                 tot = len(rows["Data_repr"].dropna().unique())
                 data.append([f"Totale: {tot} giorni"] + [""] * 5)
