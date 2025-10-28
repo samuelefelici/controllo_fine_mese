@@ -3,71 +3,28 @@ import pandas as pd
 from io import StringIO, BytesIO
 from pathlib import Path
 from processor import process_workbook, to_pdf_bytes, load_codes_map
+import csv
 
 # ================================================================
 # CONFIGURAZIONE BASE
 # ================================================================
 st.set_page_config(page_title="Controlli Fine Mese", layout="wide")
-st.title("Controlli Fine Mese - Estrazione diciture di assenza (PDF)")
+st.title("Controlli Fine Mese - Anteprima grezza del file (senza interpretare header)")
 
 repo_root = Path(__file__).parent
 codes_file = repo_root / "codes.csv"
 
 st.markdown(
     "Carica il file (.xls/.xlsx/.csv/.txt). "
-    "L'app estrae le diciture di assenza e genera un PDF ordinato per categoria → matricola → data."
+    "Questa pagina mostra il contenuto così com'è (grezzo): non interpretiamo la riga di intestazione, "
+    "non applichiamo mappature, non scaliamo gli indici. Serve per verificare esattamente come pandas vede il foglio."
 )
 
 # ================================================================
-# SIDEBAR
+# SIDEBAR (opzionale)
 # ================================================================
 st.sidebar.header("Opzioni")
-st.sidebar.markdown(f"File di mappatura codici: `{codes_file.name}`")
-
-show_raw = st.sidebar.checkbox("Mostra dati grezzi", value=False)
-infer_month = st.sidebar.checkbox("Usa mese/anno forniti se 'Data' è solo giorno", value=True)
-
-month_input = st.sidebar.selectbox(
-    "Mese",
-    [""] + [
-        "Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
-        "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"
-    ]
-)
-year_input = st.sidebar.text_input("Anno (es. 2025)", value="")
-
-# ================================================================
-# CARICAMENTO CODES MAP
-# ================================================================
-if codes_file.exists():
-    try:
-        codes_map, categories_order = load_codes_map(codes_file)
-    except Exception as e:
-        st.error(f"Errore caricamento {codes_file.name}: {e}")
-        codes_map, categories_order = {}, []
-else:
-    st.sidebar.warning(f"{codes_file.name} non trovato nella repo.")
-    uploaded_codes = st.sidebar.file_uploader("Carica codes.csv (opzionale)", type=["csv"])
-    if uploaded_codes:
-        try:
-            codes_map, categories_order = load_codes_map(uploaded_codes)
-        except Exception as e:
-            st.error(f"Errore caricamento file caricato: {e}")
-            codes_map, categories_order = {}, []
-    else:
-        codes_map, categories_order = {}, []
-
-st.sidebar.subheader("Categorie caricate")
-st.sidebar.write(", ".join(categories_order) if categories_order else "Nessuna")
-
-# ================================================================
-# MESE NUMERICO
-# ================================================================
-months_it = {
-    "Gennaio": 1, "Febbraio": 2, "Marzo": 3, "Aprile": 4, "Maggio": 5, "Giugno": 6,
-    "Luglio": 7, "Agosto": 8, "Settembre": 9, "Ottobre": 10, "Novembre": 11, "Dicembre": 12
-}
-month_num = months_it.get(month_input)
+st.sidebar.markdown(f"File di mappatura codici: `{codes_file.name}` (non usato qui)")
 
 # ================================================================
 # FILE UPLOADER
@@ -83,101 +40,110 @@ if uploaded_file is None:
     st.stop()
 
 # ================================================================
-# LETTURA FILE GREZZO (robusta, non consuma lo stream usato dopo)
+# LETTURA GREZZA E ANTEPRIMA (NESSUNA INTERPRETAZIONE DELL'HEADER)
 # ================================================================
-with st.spinner("Tentativo di lettura del file..."):
-    # Leggiamo tutti i bytes una volta sola e poi creiamo BytesIO per anteprima + elaborazione.
+with st.spinner("Caricamento grezzo in corso..."):
+    # Leggiamo i bytes una volta sola
     try:
         raw_bytes = uploaded_file.read()
     except Exception:
-        # fallback: se non è possibile leggere direttamente, proviamo a usare uploaded_file.getvalue()
         try:
             raw_bytes = uploaded_file.getvalue()
         except Exception as e:
             st.error(f"Impossibile leggere il file caricato: {e}")
             st.stop()
 
-    preview_df = None
-    read_ok = False
-    # Proviamo a leggere come Excel (.xlsx) con openpyxl, poi senza engine, poi con xlrd (.xls)
+    df = None
+    detected_format = None
+    # 1) Proviamo a leggere come Excel ma SENZA interpretare la prima riga come header:
     try:
-        preview_df = pd.read_excel(BytesIO(raw_bytes), header=0, engine="openpyxl", dtype=str)
-        st.success("File letto come Excel (.xlsx) con openpyxl")
-        read_ok = True
+        # tentativo con openpyxl (xlsx)
+        df = pd.read_excel(BytesIO(raw_bytes), header=None, engine="openpyxl", dtype=str)
+        detected_format = "Excel (letto con header=None - openpyxl)"
     except Exception:
-        # proviamo senza specificare engine (pandas sceglie)
         try:
-            preview_df = pd.read_excel(BytesIO(raw_bytes), header=0, dtype=str)
-            st.success("File letto come Excel (engine auto)")
-            read_ok = True
+            # tentativo auto engine (pandas sceglie)
+            df = pd.read_excel(BytesIO(raw_bytes), header=None, dtype=str)
+            detected_format = "Excel (letto con header=None - engine auto)"
         except Exception:
-            # proviamo engine xlrd (per .xls). Nota: xlrd recenti non supportano xlsx; potrebbe essere necessario xlrd==1.2.0
             try:
-                preview_df = pd.read_excel(BytesIO(raw_bytes), header=0, engine="xlrd", dtype=str)
-                st.success("File letto come Excel (.xls) con xlrd")
-                read_ok = True
+                # tentativo con xlrd per .xls (se presente nell'ambiente)
+                df = pd.read_excel(BytesIO(raw_bytes), header=None, engine="xlrd", dtype=str)
+                detected_format = "Excel .xls (letto con header=None - xlrd)"
             except Exception:
-                # Non è stato possibile leggere come Excel: proviamo come testo/csv
-                pass
+                df = None
 
-    if not read_ok:
-        # Decodifica testo provando utf-8 prima, poi latin-1 (cp1252 già gestito come latin-1)
+    # 2) Se non è Excel, proviamo come testo/CSV e NON interpretiamo header (header=None)
+    if df is None:
         try:
-            text = raw_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            text = raw_bytes.decode("latin-1", errors="replace")
-
-        # Proviamo separatori comuni
-        tried = []
-        for sep, label in [("\t", ".txt (tab)"), (";", "CSV ';'"), (",", "CSV ','")]:
+            # decodifica testo per provare sniffing
             try:
-                preview_df = pd.read_csv(StringIO(text), sep=sep, header=0, dtype=str)
-                st.success(f"File letto come testo: {label}")
-                read_ok = True
-                break
-            except Exception as e:
-                tried.append((sep, str(e)))
-                continue
+                text = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw_bytes.decode("latin-1", errors="replace")
 
-        if not read_ok:
-            st.error("Impossibile interpretare il file come Excel o testo tabulato/CSV.")
+            # proviamo a usare csv.Sniffer per determinare il separatore più probabile
+            try:
+                sniffer = csv.Sniffer()
+                dialect = sniffer.sniff(text[:4096])
+                sep = dialect.delimiter
+            except Exception:
+                # fallback a tab, ;, ,
+                for candidate in ["\t", ";", ","]:
+                    try:
+                        tmp = pd.read_csv(StringIO(text), sep=candidate, header=None, nrows=2, dtype=str)
+                        sep = candidate
+                        break
+                    except Exception:
+                        sep = None
+                if sep is None:
+                    sep = ","  # ultima risorsa
+
+            df = pd.read_csv(StringIO(text), sep=sep, header=None, dtype=str)
+            detected_format = f"Testo/CSV (sep='{sep}') - letto con header=None"
+        except Exception as e:
+            st.error(f"Impossibile interpretare il file come Excel o CSV/TXT: {e}")
             st.stop()
 
-    # Se siamo qui preview_df è valorizzato
-    df = preview_df.fillna("")
+    # Normalizziamo i NaN a stringa vuota per una visualizzazione pulita
+    df = df.fillna("")
 
-st.write("✅ Anteprima file caricato:")
-st.dataframe(df.head(20))
+st.success(f"Caricato: {detected_format}")
+st.write("✅ Anteprima grezza (prime 20 righe, header NON interpretato):")
+st.dataframe(df.head(20), use_container_width=True)
 
-st.write("Colonne trovate:")
+st.write("Informazioni grezze:")
+st.write(f"Dimensione DataFrame: {df.shape[0]} righe × {df.shape[1]} colonne")
+st.write("Colonne (index così come pandas le riporta):")
 for i, c in enumerate(df.columns):
-    st.write(f"{i}: {c}")
+    st.write(f"{i}: {c!s}")
 
-# ================================================================
-# ELABORAZIONE NORMALE (usiamo BytesIO(raw_bytes) per non dipendere dallo stream consumato)
-# ================================================================
-with st.spinner("Elaborazione file..."):
-    try:
-        # Creiamo un nuovo BytesIO per la funzione di process_workbook (pointer a 0)
-        file_for_processing = BytesIO(raw_bytes)
-        file_for_processing.seek(0)
-        grouped_df, df_valid, inferred_month_str = process_workbook(
-            file_for_processing,
-            codes_map,
-            infer_month=infer_month,
-            month_for_days=month_num,
-            year_for_days=(int(year_input) if year_input.strip().isdigit() else None)
-        )
-    except Exception as e:
-        st.error(f"Errore durante l'elaborazione: {e}")
-        st.stop()
+st.write("Prime 20 righe (visualizzazione testuale):")
+rows_preview = df.head(20).astype(str).values.tolist()
+for r in rows_preview:
+    st.text(" | ".join(r))
 
-# ================================================================
-# ANTEPRIMA RISULTATI
-# ================================================================
-st.subheader("Anteprima riepilogo (aggregato)")
-st.dataframe(grouped_df, use_container_width=True)
+st.markdown("---")
+st.info("Questa vista mostra il file così com'è: la prima riga del foglio viene mostrata come riga 0 (non come intestazione). "
+        "Se vedi che le intestazioni sono già in una riga interna, ora puoi indicarmi qual è la riga giusta o chiedermi di rilevare automaticamente la riga di header e rieffettuare l'anteprima interpretata.")
 
-if show_raw:
-    st.subheader("Dati validi (righe filtrate, anteprima)")
-    st.dataframe(df_valid.head(200), use_container_width=True)
+# Opzione: procedere con l'elaborazione normale usando il BytesIO originale
+if st.button("Procedi con l'elaborazione (usando il file caricato)"):
+    with st.spinner("Elaborazione in corso..."):
+        try:
+            file_for_processing = BytesIO(raw_bytes)
+            file_for_processing.seek(0)
+            grouped_df, df_valid, inferred_month_str = process_workbook(
+                file_for_processing,
+                load_codes_map(codes_file)[0] if codes_file.exists() else {},
+                infer_month=True,
+                month_for_days=None,
+                year_for_days=None
+            )
+            st.success("Elaborazione completata.")
+            st.subheader("Anteprima riepilogo (aggregato)")
+            st.dataframe(grouped_df, use_container_width=True)
+            st.subheader("Dati validi (anteprima)")
+            st.dataframe(df_valid.head(200), use_container_width=True)
+        except Exception as e:
+            st.error(f"Errore durante l'elaborazione: {e}")
