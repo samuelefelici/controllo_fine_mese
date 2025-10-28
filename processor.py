@@ -1,3 +1,12 @@
+"""
+processor.py - versione Conerobus (ottobre 2025) - FIX ALLINEAMENTO
+
+PROBLEMA: Le prime 5 colonne NON hanno intestazione nel file originale.
+Le intestazioni partono dalla colonna 6 (shift di 5 posizioni).
+
+Soluzione: Ricostruiamo le intestazioni corrette ignorando quelle presenti.
+"""
+
 import re
 import csv
 import warnings
@@ -98,104 +107,127 @@ def _read_xls_try_header(uploaded_file, max_header_row_search=10):
 
 
 # ============================================================
-# UTILI PER MAPPATURA COLONNE
+# FIX INTESTAZIONI SPOSTATE
 # ============================================================
 
-def _find_col_by_keywords(df: pd.DataFrame, keywords: List[str], fallback_index: Optional[int] = None) -> Optional[str]:
-    """Cerca una colonna il cui nome contiene una delle keywords (case-insensitive)."""
-    lowered = [str(c).lower() for c in df.columns]
-    for i, name in enumerate(lowered):
-        for kw in keywords:
-            if kw in name:
-                return df.columns[i]
-    if fallback_index is not None and 0 <= fallback_index < len(df.columns):
-        return df.columns[fallback_index]
-    return None
+def fix_misaligned_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    FIX per il problema Conerobus: le prime 5 colonne hanno dati ma NON hanno intestazione.
+    Le intestazioni reali partono dalla colonna 6.
+    
+    Strategia: ricostruiamo le intestazioni corrette basandoci sulla posizione dei dati.
+    """
+    df = df.copy()
+    
+    # Conta quante colonne hanno intestazione vuota o generica
+    empty_header_cols = []
+    for i, col in enumerate(df.columns):
+        col_str = str(col).strip()
+        # Se la colonna è vuota, ha nome "Unnamed", o è solo spazi
+        if not col_str or col_str.startswith("Unnamed") or col_str == "":
+            empty_header_cols.append(i)
+        else:
+            break  # Ci fermiamo alla prima colonna con intestazione valida
+    
+    num_empty = len(empty_header_cols)
+    
+    if num_empty >= 5:
+        # Ricostruiamo le intestazioni corrette per le prime 5 colonne
+        new_columns = list(df.columns)
+        new_columns[0] = "Residenza"
+        new_columns[1] = "Matricola"
+        new_columns[2] = "Cognome"
+        new_columns[3] = "Nome"
+        new_columns[4] = "Gruppo"
+        
+        # Le colonne successive mantengono le intestazioni originali (già presenti)
+        # MA sono spostate: dobbiamo rinominare anche quelle
+        if len(df.columns) > 5:
+            new_columns[5] = "Data"
+        if len(df.columns) > 6:
+            new_columns[6] = "GiornoSettimana"
+        if len(df.columns) > 7:
+            new_columns[7] = "TurnoC"
+        if len(df.columns) > 8:
+            new_columns[8] = "InizioC"
+        if len(df.columns) > 9:
+            new_columns[9] = "FineC"
+        if len(df.columns) > 10:
+            new_columns[10] = "ValoreC"
+        if len(df.columns) > 11:
+            new_columns[11] = "DistaccatoE"
+        if len(df.columns) > 12:
+            new_columns[12] = "TurnoE"
+        if len(df.columns) > 13:
+            new_columns[13] = "InizioE"
+        if len(df.columns) > 14:
+            new_columns[14] = "FineE"
+        if len(df.columns) > 15:
+            new_columns[15] = "ValoreE"
+        if len(df.columns) > 16:
+            new_columns[16] = "Indennita"
+        if len(df.columns) > 17:
+            new_columns[17] = "Aggiuntive"
+        
+        df.columns = new_columns
+    
+    return df
 
 
 # ============================================================
-# NORMALIZZAZIONE (struttura AGGIORNATA Conerobus)
+# NORMALIZZAZIONE
 # ============================================================
 
 def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalizza il file mensile Conerobus con struttura AGGIORNATA:
-    0=Residenza, 1=Matricola, 2=Cognome, 3=Nome, 4=Gruppo,
-    5=Data (giorno numerico), 11=TurnoE
+    Normalizza il file mensile Conerobus DOPO aver corretto le intestazioni.
     """
     df = df.copy()
     df = df.dropna(how="all")
     if df.empty:
         return df
-
-    # INDICI CORRETTI per la NUOVA struttura
-    expected_indices = {
-        "Residenza": 0,
-        "Mat": 1,
-        "Cognome": 2,
-        "Nome": 3,
-        "Gruppo": 4,
-        "Data_raw": 5,
-        "TurnoE": 11,
-    }
-
-    # Ricerca colonne con fallback agli indici corretti
-    residenza_col = _find_col_by_keywords(df, ["residenza", "sede"], fallback_index=0)
-    mat_col = _find_col_by_keywords(df, ["mat", "matricola"], fallback_index=1)
-    cognome_col = _find_col_by_keywords(df, ["cognome", "surname"], fallback_index=2)
-    nome_col = _find_col_by_keywords(df, ["nome", "name"], fallback_index=3)
-    gruppo_col = _find_col_by_keywords(df, ["gruppo", "group"], fallback_index=4)
-    data_col = _find_col_by_keywords(df, ["data", "giorno", "day"], fallback_index=5)
-    turno_col = _find_col_by_keywords(df, ["turnoe", "turno e", "turnoE"], fallback_index=11)
-
-    col_map = {}
-    if residenza_col is not None:
-        col_map[residenza_col] = "Residenza"
-    if mat_col is not None:
-        col_map[mat_col] = "Mat"
-    if cognome_col is not None:
-        col_map[cognome_col] = "Cognome"
-    if nome_col is not None:
-        col_map[nome_col] = "Nome"
-    if gruppo_col is not None:
-        col_map[gruppo_col] = "Gruppo"
-    if data_col is not None:
-        col_map[data_col] = "Data_raw"
-    if turno_col is not None:
-        col_map[turno_col] = "TurnoE"
-
-    if col_map:
-        df = df.rename(columns=col_map)
-
-    # Garantiamo l'esistenza delle colonne necessarie
-    for required in ["Residenza", "Mat", "Cognome", "Nome", "Gruppo", "Data_raw", "TurnoE"]:
-        if required not in df.columns:
-            df[required] = ""
-
-    # Aggiungiamo colonne per compatibilità con app.py
+    
+    # PRIMA: correggi le intestazioni spostate
+    df = fix_misaligned_headers(df)
+    
+    # ORA le colonne dovrebbero essere corrette
+    # Verifichiamo che esistano le colonne necessarie
+    required_cols = ["Residenza", "Matricola", "Cognome", "Nome", "Data", "TurnoE"]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = ""
+    
+    # Rinominiamo per compatibilità con il resto del codice
+    df = df.rename(columns={
+        "Matricola": "Mat",
+        "Data": "Data_raw",
+    })
+    
+    # Aggiungiamo colonne mancanti
     if "Qualifica" not in df.columns:
         df["Qualifica"] = ""
     if "Giorno" not in df.columns:
-        df["Giorno"] = ""
-
+        df["Giorno"] = df.get("GiornoSettimana", "")
+    
     # Pulizia dati
     df["Residenza"] = df["Residenza"].astype(str).str.strip().str.upper().replace("NAN", "")
     df["Mat"] = df["Mat"].astype(str).str.strip().replace("nan", "")
     df["Cognome"] = df["Cognome"].astype(str).str.strip().str.upper().replace("NAN", "")
     df["Nome"] = df["Nome"].astype(str).str.strip().str.upper().replace("NAN", "")
-    df["Gruppo"] = df["Gruppo"].astype(str).str.strip().replace("nan", "")
-
+    df["Gruppo"] = df.get("Gruppo", pd.Series([""] * len(df))).astype(str).str.strip().replace("nan", "")
+    df["Giorno"] = df["Giorno"].astype(str).str.strip().str.capitalize().replace("Nan", "")
+    
     # Data (estrazione numero giorno)
     def _extract_first_number(v):
         s = str(v)
         m = re.search(r"(\d+)", s)
         return m.group(1) if m else ""
-
+    
     df["Data_raw"] = df["Data_raw"].apply(_extract_first_number).fillna("").astype(str)
-
+    
     # Turno
     df["Turno_raw"] = df["TurnoE"].astype(str).fillna("").str.strip().replace("nan", "")
-
+    
     # Tokenizzazione turno
     def _tokenize_turno(x):
         if x is None:
@@ -203,9 +235,9 @@ def normalize_conerobus_df(df: pd.DataFrame) -> pd.DataFrame:
         s = str(x)
         parts = [t.strip() for t in s.split() if t.strip()]
         return parts
-
+    
     df["Turno_tokens"] = df["Turno_raw"].apply(_tokenize_turno)
-
+    
     return df
 
 
