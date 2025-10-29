@@ -9,7 +9,8 @@ st.set_page_config(page_title="Controllo Paghe", layout="wide")
 st.title("Controllo Paghe")
 
 st.markdown(
-    "Carica il file. Verranno mostrate in anteprima SOLO le colonne: Matricola, Cognome, Nome, Data, giorno (colonna subito dopo Data) e TurnoE."
+    "Carica il file. Verranno mostrate in anteprima SOLO le colonne: Matricola, Cognome, Nome, Data, "
+    "giorno (colonna subito dopo Data) e TurnoE. Encoding e separatore sono rilevati automaticamente."
 )
 
 uploaded_file = st.file_uploader(
@@ -147,10 +148,8 @@ def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     # se 'Data' trovata, prendiamo la colonna immediatamente dopo (anche se ha intestazione vuota)
     giorno_source = None
     if idx_data is not None and (idx_data + 1) < len(cols):
-        # prendiamo il nome della colonna successiva (può essere "")
         giorno_source = cols[idx_data + 1]
 
-    # se giorno_source ancora None, cerchiamo una colonna esplicitamente chiamata 'Giorno' o una colonna vuota
     if giorno_source is None:
         empty_col = next((c for c in cols if c == ""), None)
         if empty_col is not None:
@@ -167,7 +166,6 @@ def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     cognome_col = find_col("Cognome")
     nome_col = find_col("Nome")
     data_col = find_col("Data")
-    # possibili varianti per TurnoE
     turnoe_col = next((c for c in cols if c.lower().replace(" ", "") in ("turnoe", "turnoe", "turnoe")), None)
 
     result = pd.DataFrame()
@@ -175,7 +173,6 @@ def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     result["Cognome"] = df2[cognome_col] if cognome_col in df2.columns and cognome_col else ""
     result["Nome"] = df2[nome_col] if nome_col in df2.columns and nome_col else ""
     result["Data"] = df2[data_col] if data_col in df2.columns and data_col else ""
-    # Se giorno_source è definito e presente tra le colonne (anche se è ""), usalo; altrimenti crea vuoto
     if giorno_source is not None and giorno_source in df2.columns:
         result["giorno"] = df2[giorno_source]
     else:
@@ -210,20 +207,16 @@ if uploaded_file is not None:
             mime="text/csv",
         )
     else:
-        # file testuale: rileviamo automaticamente encoding/separatore ma NON mostriamo la lista di candidati
+        # file testuale: rileviamo automaticamente encoding/separatore (ma NON mostriamo campi per forzarli)
         candidates = generate_encoding_candidates(raw, n_top=4)
         detected_enc, _ = detect_with_chardet(raw)
         top_enc = candidates[0]["encoding"] if candidates else (detected_enc or "utf-8")
-        # snippet per guess separator se disponibile
         snippet = candidates[0]["snippet"] if candidates else (raw.decode("latin1", errors="replace")[:1000])
         guessed_sep = guess_separator_from_text(snippet)
 
-        # campi per forzare encoding/separatore (ma senza mostrare candidati)
-        manual_enc = st.text_input("Forza encoding (lascia vuoto per rilevamento automatico)", value="")
-        manual_sep = st.text_input("Forza separatore (es. '\\t' o ';' o ',' o '\\\\s+' per whitespace)", value=guessed_sep)
-
-        enc_to_use = manual_enc.strip() if manual_enc.strip() else top_enc
-        sep_to_use = manual_sep.strip() if manual_sep.strip() else guessed_sep
+        # usiamo automaticamente rilevamento (nessun campo visibile per forzare)
+        enc_to_use = top_enc
+        sep_to_use = guessed_sep
 
         try:
             decoded_full = raw.decode(enc_to_use)
@@ -234,7 +227,7 @@ if uploaded_file is not None:
             df = robust_read_text_to_df(decoded_full, sep_to_use)
             df = clean_dataframe_strings(df)
             df_sel = select_required_columns(df)
-            st.subheader("Anteprima (prime 19 righe) — colonne richieste")
+            st.subheader("Anteprima")
             st.dataframe(df_sel.head(19))
             st.write(f"Dimensione dati (colonne richieste): {df_sel.shape[0]} righe × {df_sel.shape[1]} colonne")
             st.download_button(
