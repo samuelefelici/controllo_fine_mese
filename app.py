@@ -1,151 +1,213 @@
-# app.py
 import streamlit as st
 import pandas as pd
 from io import BytesIO, StringIO
 import csv
+import chardet
 
 st.set_page_config(page_title="Controllo Paghe", layout="wide")
 st.title("Controllo Paghe")
 
-st.markdown("Carica un file (anche se ha estensione .xls/.xlsx ma è in realtà un file di testo). L'app proverà a rilevarne il formato e mostrerà le prime 19 righe.")
+st.markdown(
+    "Carica il file. Se l'anteprima appare in cinese significa che l'encoding usato è sbagliato: "
+    "qui sotto vengono provate più decodifiche e puoi scegliere quella corretta."
+)
 
-uploaded_file = st.file_uploader("Carica file (xls, xlsx o file testo salvato come .xls)", type=["xls", "xlsx", "csv", "txt"])
+uploaded_file = st.file_uploader("Carica file (xls, xlsx, csv, txt - anche se ha estensione .xls)", type=["xls", "xlsx", "csv", "txt"])
+
+# parole chiave italiane attese per aiutare il riconoscimento
+KEYWORDS = ["Residenza", "Matricola", "Cognome", "Nome", "Gruppo", "Data", "Turno", "Inizio", "Fine"]
+
+ENC_CANDIDATES = [
+    "utf-8",
+    "utf-8-sig",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+    "cp1252",
+    "iso-8859-1",
+    "latin1",
+    "cp1250",
+]
 
 def try_read_excel(raw_bytes):
     try:
+        # prova con pandas.read_excel (per .xls/.xlsx veri)
         sheets = pd.read_excel(BytesIO(raw_bytes), sheet_name=None, engine=None)
-        # Se è un dict (più fogli), prendi il primo foglio per la preview
         if isinstance(sheets, dict):
-            first_sheet = list(sheets.keys())[0]
-            return sheets[first_sheet], f"excel (foglio '{first_sheet}')"
+            first = list(sheets.keys())[0]
+            return sheets[first], f"excel (foglio '{first}')"
         return sheets, "excel"
     except Exception:
         return None, None
 
-def detect_text_format_and_read(raw_bytes):
-    # prova vari encoding comuni
-    encodings = ["utf-8", "utf-16", "cp1252", "latin1"]
-    text = None
-    used_enc = None
-    for enc in encodings:
+def score_decoded_text(text: str) -> int:
+    t = text.lower()
+    score = 0
+    # conta occorrenze delle parole chiave
+    for kw in KEYWORDS:
+        score += t.count(kw.lower())
+    # penalizza caratteri di replacement o troppi caratteri non-ASCII visuali 
+    score -= text.count("�") * 5
+    return score
+
+def detect_with_chardet(raw_bytes: bytes):
+    try:
+        res = chardet.detect(raw_bytes)
+        return res.get("encoding"), res.get("confidence", 0.0)
+    except Exception:
+        return None, 0.0
+
+def generate_encoding_candidates(raw_bytes: bytes, n_top=6):
+    # prima: lascia che chardet suggerisca
+    detected_enc, conf = detect_with_chardet(raw_bytes)
+    candidates = list(ENC_CANDIDATES)
+    if detected_enc:
+        # metti in testa la rilevata (ma senza duplicati)
+        detected_enc = detected_enc.lower()
+        if detected_enc not in candidates:
+            candidates.insert(0, detected_enc)
+        else:
+            candidates.remove(detected_enc)
+            candidates.insert(0, detected_enc)
+
+    scored = []
+    sample_bytes = raw_bytes[:8000]  # campione
+    for enc in candidates:
         try:
-            text = raw_bytes.decode(enc)
-            used_enc = enc
-            break
+            decoded = sample_bytes.decode(enc)
         except Exception:
-            continue
-    if text is None:
-        # fallback permissivo
-        text = raw_bytes.decode("latin1", errors="replace")
-        used_enc = "latin1 (fallback, with replace)"
+            # prova decode permissivo (sostituisce gli errori)
+            try:
+                decoded = sample_bytes.decode(enc, errors="replace")
+            except Exception:
+                continue
+        sc = score_decoded_text(decoded)
+        # calcola anche percentuale di caratteri non-stampa visibili (approssimazione)
+        non_printable = sum(1 for ch in decoded if ord(ch) < 9 or (11 <= ord(ch) <= 31))
+        scored.append({"encoding": enc, "score": sc, "snippet": decoded[:1000], "non_print": non_printable})
 
-    sample = text.lstrip()[:1000].lower()
+    # ordina per score desc, non_print asc
+    scored_sorted = sorted(scored, key=lambda x: (-x["score"], x["non_print"]))
+    return scored_sorted[:n_top]
 
-    # HTML?
-    if sample.startswith("<html") or "<table" in sample:
-        try:
-            dfs = pd.read_html(StringIO(text))
-            if dfs:
-                return dfs[0], f"html (parsed via read_html), encoding={used_enc}"
-        except Exception:
-            pass
-
-    # XML (Spreadsheet)?
-    if sample.startswith("<?xml"):
-        try:
-            # pandas.read_xml può funzionare per alcuni XML tabulari
-            df = pd.read_xml(StringIO(text))
-            return df, f"xml, encoding={used_enc}"
-        except Exception:
-            pass
-
-    # SYLK (starts with ID;)
-    if sample.startswith("id;"):
-        try:
-            df = pd.read_csv(StringIO(text), sep=";", engine="python", encoding=used_enc)
-            return df, f"sylk-like (read as ;-sep), encoding={used_enc}"
-        except Exception:
-            pass
-
-    # Prova a sniffare il separatore con csv.Sniffer
-    first_lines = "\n".join(text.splitlines()[:20])
+def guess_separator_from_text(text: str):
+    # prova csv.Sniffer su prime righe
+    lines = "\n".join(text.splitlines()[:20])
     try:
         sniffer = csv.Sniffer()
-        dialect = sniffer.sniff(first_lines)
+        dialect = sniffer.sniff(lines)
         sep = dialect.delimiter
-        # se separatore è whitespace, preferiamo tab o comma
         if sep.isspace():
             sep = "\t"
     except Exception:
-        # heuristics: prefer tab se contiene \t, altrimenti ; o ,
-        if "\t" in first_lines:
+        if "\t" in lines:
             sep = "\t"
-        elif ";" in first_lines:
+        elif ";" in lines:
             sep = ";"
-        elif "," in first_lines:
+        elif "," in lines:
             sep = ","
         else:
-            # fallback: split by whitespace
             sep = r"\s+"
+    return sep
 
-    # prova lettura con il separatore trovato, poi con altri comuni
-    tried = []
-    for sep_try in [sep, "\t", ";", ",", r"\s+"]:
-        if sep_try in tried:
-            continue
-        tried.append(sep_try)
-        try:
-            if sep_try == r"\s+":
-                df = pd.read_csv(StringIO(text), sep=r"\s+", engine="python", encoding=used_enc)
-            else:
-                df = pd.read_csv(StringIO(text), sep=sep_try, engine="python", encoding=used_enc)
-            return df, f"text, sep='{sep_try}', encoding={used_enc}"
-        except Exception:
-            continue
-
-    # Se tutto fallisce, ritorna None
-    return None, f"unknown text format, tried encodings={encodings}"
-
-def detect_and_read(uploaded):
-    raw = uploaded.read()
-    # Reset file pointer not necessary perché abbiamo letto tutto in raw
-    # 1) prova come vero excel
-    df, info = try_read_excel(raw)
-    if df is not None:
-        return df, info
-    # 2) prova come testo/CSV/TSV/HTML/XML/SYLK
-    df, info = detect_text_format_and_read(raw)
-    return df, info
+def read_text_to_df(decoded_text: str, sep_choice: str):
+    # prova a leggere con pandas.read_csv usando engine python per regex sep
+    si = StringIO(decoded_text)
+    try:
+        if sep_choice == r"\s+":
+            df = pd.read_csv(si, sep=r"\s+", engine="python")
+        else:
+            df = pd.read_csv(si, sep=sep_choice, engine="python")
+        return df
+    except Exception as e:
+        # fallback: provare con separatori comuni
+        for s in ["\t", ";", ",", r"\s+"]:
+            si.seek(0)
+            try:
+                if s == r"\s+":
+                    df = pd.read_csv(si, sep=r"\s+", engine="python")
+                else:
+                    df = pd.read_csv(si, sep=s, engine="python")
+                return df
+            except Exception:
+                continue
+        raise e
 
 if uploaded_file is not None:
-    df, info = detect_and_read(uploaded_file)
-    if df is None:
-        st.error(f"Impossibile determinare/leggere il formato del file. Info rilevate: {info}")
-    else:
-        st.success(f"File caricato. Formato rilevato: {info}")
+    raw = uploaded_file.read()
+    # 1) prova come vero excel
+    df_excel, info = try_read_excel(raw)
+    if df_excel is not None:
+        st.success(f"File letto come {info}")
         st.subheader("Anteprima (prime 19 righe)")
-        try:
-            st.dataframe(df.head(19))
-        except Exception:
-            st.write(df.head(19))
+        st.dataframe(df_excel.head(19))
+    else:
+        # 2) file testuale: genera candidati encodings
+        st.info("File riconosciuto come testo. Provo diverse decodifiche...")
+        candidates = generate_encoding_candidates(raw, n_top=8)
 
-        # pulizia minima
-        def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-            df_clean = df.copy()
-            df_clean.columns = [c.strip() if isinstance(c, str) else c for c in df_clean.columns]
-            def _strip_val(x):
-                return x.strip() if isinstance(x, str) else x
-            df_clean = df_clean.applymap(_strip_val)
-            return df_clean
+        st.subheader("Decodifiche candidate (scegli quella che mostra intestazioni leggibili)")
+        # mostra elenco con snippet e punteggio
+        enc_options = []
+        for i, c in enumerate(candidates):
+            label = f"{i+1}) {c['encoding']} — score={c['score']} — non_print={c['non_print']}"
+            enc_options.append((label, c))
 
-        df_clean = clean_dataframe(df)
+        # prepariamo visuale radio
+        labels = [lab for lab, _ in enc_options]
+        sel_idx = st.radio("Decodifiche trovate (anteprima snippet):", options=list(range(len(labels))), format_func=lambda i: labels[i]) if labels else None)
+
+        if labels:
+            chosen = enc_options[sel_idx][1]
+            st.markdown(f"**Encoding suggerito:** {chosen['encoding']}  — punteggio: {chosen['score']}")
+            st.code(chosen['snippet'][:1000], language="text")
+            # suggerisci separatore
+            guessed_sep = guess_separator_from_text(chosen["snippet"])
+            st.write(f"Separatore suggerito: '{guessed_sep}'")
+        else:
+            st.write("Nessuna decodifica candidata trovata.")
+
+        # opzioni manuali
         st.markdown("---")
-        st.write(f"Dimensione dati: {df_clean.shape[0]} righe × {df_clean.shape[1]} colonne")
-        st.download_button(
-            label="Scarica CSV pulito",
-            data=df_clean.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_pulito.csv",
-            mime="text/csv",
-        )
+        st.subheader("Opzioni manuali / prova diretta")
+        manual_enc = st.text_input("Forza encoding (lascia vuoto per usare la selezione sopra)", value="")
+        enc_to_use = manual_enc.strip() if manual_enc.strip() else (chosen["encoding"] if labels else "utf-8")
+        st.write(f"Encoding selezionato per il parsing: {enc_to_use}")
+
+        manual_sep = st.text_input("Forza separatore (es. '\\t' o ';' o ',' o '\\\\s+' per whitespace)", value=(guessed_sep if labels else "\\s+"))
+        st.write(f"Separatore usato per il parsing: {manual_sep}")
+
+        # decode full text con l'encoding scelto (con fallback permissivo)
+        try:
+            decoded_full = raw.decode(enc_to_use)
+        except Exception:
+            decoded_full = raw.decode(enc_to_use, errors="replace")
+
+        # prova convertire in DataFrame
+        try:
+            df = read_text_to_df(decoded_full, manual_sep)
+            st.success("Lettura testo -> DataFrame avvenuta con successo")
+            st.subheader("Anteprima (prime 19 righe)")
+            st.dataframe(df.head(19))
+            # pulizia di base
+            def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+                df_clean = df.copy()
+                df_clean.columns = [c.strip() if isinstance(c, str) else c for c in df_clean.columns]
+                def _strip_val(x):
+                    return x.strip() if isinstance(x, str) else x
+                df_clean = df_clean.applymap(_strip_val)
+                return df_clean
+            df_clean = clean_dataframe(df)
+            st.write(f"Dimensione dati: {df_clean.shape[0]} righe × {df_clean.shape[1]} colonne")
+            st.download_button(
+                label="Scarica CSV pulito",
+                data=df_clean.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_pulito.csv",
+                mime="text/csv",
+            )
+        except Exception as e:
+            st.error(f"Impossibile convertire il testo in tabella: {e}")
+            st.markdown("Mostro un'anteprima testuale dello stream decodificato per debug:")
+            st.code(decoded_full[:2000], language="text")
 else:
     st.info("Carica un file per iniziare.")
