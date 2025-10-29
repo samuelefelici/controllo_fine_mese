@@ -410,7 +410,7 @@ if uploaded_file is None:
     st.stop()
 
 # Show the upload confirmation message (user requested exact text)
-st.success("File caricato correttametne")
+st.success("File caricato correttamente")
 
 # lettura file (excel o testo) - detection automatica
 raw = uploaded_file.read()
