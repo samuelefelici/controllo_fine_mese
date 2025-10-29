@@ -22,7 +22,7 @@ st.set_page_config(page_title="Controllo Paghe", layout="wide")
 st.title("Controllo Paghe")
 
 st.markdown(
-    "Carica il file Riepilogo Mensile per Excel - Dettagliato DB.Poi scegli le categorie di Assenza e Mese/Anno, poi clicca 'Elabora' "
+    "Carica il file Riepilogo Mensile per Excel - Dettagliato DB."
 )
 
 # -------------------- utilities e parsing robusto (come prima) --------------------
@@ -379,7 +379,7 @@ categories_available = sorted(list(codes_map.keys())) if codes_map else []
 if not categories_available:
     st.warning("Attenzione: non è stato trovato 'codes.csv' nella repo. Le categorie non saranno disponibili.")
 else:
-    st.markdown("Seleziona le categorie di assenza da visualizzare (verranno elaborate SEPARATAMENTE, una categoria dopo l'altra):")
+    st.markdown("Seleziona le categorie di assenza, Mese e Anno di riferimento")
     chosen_categories = st.multiselect("Categorie", options=categories_available, default=[])
 
 # Mese e Anno input
