@@ -9,9 +9,7 @@ st.set_page_config(page_title="Controllo Paghe", layout="wide")
 st.title("Controllo Paghe")
 
 st.markdown(
-    "Carica il file. L'app rileva il formato/encoding e mostra in anteprima SOLO le colonne richieste: "
-    "Matricola, Cognome, Nome, Data, (colonna vuota dopo Data -> rinominata 'giorno'), TurnoE. "
-    "Se la colonna dopo Data non ha intestazione la chiameremo 'giorno'."
+    "Carica il file. Verranno mostrate in anteprima SOLO le colonne: Matricola, Cognome, Nome, Data, giorno (colonna subito dopo Data) e TurnoE."
 )
 
 uploaded_file = st.file_uploader(
@@ -19,19 +17,10 @@ uploaded_file = st.file_uploader(
     type=["xls", "xlsx", "csv", "txt"],
 )
 
-# parole chiave italiane attese per aiutare il riconoscimento
 KEYWORDS = ["Residenza", "Matricola", "Cognome", "Nome", "Gruppo", "Data", "Turno", "Inizio", "Fine"]
-
 ENC_CANDIDATES = [
-    "utf-8",
-    "utf-8-sig",
-    "utf-16",
-    "utf-16-le",
-    "utf-16-be",
-    "cp1252",
-    "iso-8859-1",
-    "latin1",
-    "cp1250",
+    "utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
+    "cp1252", "iso-8859-1", "latin1", "cp1250",
 ]
 
 def try_read_excel(raw_bytes):
@@ -39,10 +28,10 @@ def try_read_excel(raw_bytes):
         sheets = pd.read_excel(BytesIO(raw_bytes), sheet_name=None, engine=None)
         if isinstance(sheets, dict):
             first = list(sheets.keys())[0]
-            return sheets[first], f"excel (foglio '{first}')"
-        return sheets, "excel"
+            return sheets[first]
+        return sheets
     except Exception:
-        return None, None
+        return None
 
 def score_decoded_text(text: str) -> int:
     t = text.lower()
@@ -59,8 +48,8 @@ def detect_with_chardet(raw_bytes: bytes):
     except Exception:
         return None, 0.0
 
-def generate_encoding_candidates(raw_bytes: bytes, n_top=6):
-    detected_enc, conf = detect_with_chardet(raw_bytes)
+def generate_encoding_candidates(raw_bytes: bytes, n_top=4):
+    detected_enc, _ = detect_with_chardet(raw_bytes)
     candidates = list(ENC_CANDIDATES)
     if detected_enc:
         detected_enc = detected_enc.lower()
@@ -70,8 +59,8 @@ def generate_encoding_candidates(raw_bytes: bytes, n_top=6):
             candidates.remove(detected_enc)
             candidates.insert(0, detected_enc)
 
-    scored = []
     sample_bytes = raw_bytes[:8000]
+    scored = []
     for enc in candidates:
         try:
             decoded = sample_bytes.decode(enc)
@@ -83,7 +72,6 @@ def generate_encoding_candidates(raw_bytes: bytes, n_top=6):
         sc = score_decoded_text(decoded)
         non_printable = sum(1 for ch in decoded if ord(ch) < 9 or (11 <= ord(ch) <= 31))
         scored.append({"encoding": enc, "score": sc, "snippet": decoded[:1000], "non_print": non_printable})
-
     scored_sorted = sorted(scored, key=lambda x: (-x["score"], x["non_print"]))
     return scored_sorted[:n_top]
 
@@ -110,7 +98,6 @@ def parse_rows_with_sep(decoded_text: str, sep_choice: str):
     lines = [ln for ln in decoded_text.splitlines() if ln.strip() != ""]
     if not lines:
         return []
-
     if sep_choice in (r"\\t", r"\t", "\\t", "\t"):
         delimiter = "\t"
         reader = csv.reader(lines, delimiter=delimiter)
@@ -121,13 +108,11 @@ def parse_rows_with_sep(decoded_text: str, sep_choice: str):
         delimiter = sep_choice
         reader = csv.reader(lines, delimiter=delimiter)
         rows = [row for row in reader]
-
     return rows
 
 def robust_rows_to_df(rows):
     if not rows:
         return pd.DataFrame()
-
     header = [h.strip() for h in rows[0]]
     hdr_len = len(header)
     processed = []
@@ -152,37 +137,29 @@ def robust_read_text_to_df(decoded_text: str, sep_choice: str):
     return df
 
 def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Seleziona e ritorna un DataFrame contenente solo queste colonne, rinominate come indicato:
-    Matricola, Cognome, Nome, Data, giorno, TurnoE
-    - 'giorno' è la colonna che si trova immediatamente dopo la colonna 'Data'; se non esiste,
-      cerchiamo una colonna vuota o con nome 'Giorno'. Se comunque non si trova, viene creata vuota.
-    - Se una delle colonne richieste non esiste, viene aggiunta come colonna vuota.
-    """
     df2 = df.copy()
-    # Normalizza nomi colonne
     cols = [str(c).strip() if c is not None else "" for c in df2.columns]
     df2.columns = cols
 
     # trova indice della colonna 'Data' (case-insensitive)
     idx_data = next((i for i, c in enumerate(cols) if c.lower() == "data"), None)
 
+    # se 'Data' trovata, prendiamo la colonna immediatamente dopo (anche se ha intestazione vuota)
     giorno_source = None
-    if idx_data is not None and idx_data + 1 < len(cols):
-        # colonna subito dopo 'Data'
+    if idx_data is not None and (idx_data + 1) < len(cols):
+        # prendiamo il nome della colonna successiva (può essere "")
         giorno_source = cols[idx_data + 1]
 
-    # se non trovata, cerca colonna vuota o colonna 'Giorno'
-    if not giorno_source:
+    # se giorno_source ancora None, cerchiamo una colonna esplicitamente chiamata 'Giorno' o una colonna vuota
+    if giorno_source is None:
         empty_col = next((c for c in cols if c == ""), None)
-        if empty_col:
+        if empty_col is not None:
             giorno_source = empty_col
         else:
             daycol = next((c for c in cols if c.lower() == "giorno"), None)
-            if daycol:
+            if daycol is not None:
                 giorno_source = daycol
 
-    # trova colonne esistenti (case-insensitive search)
     def find_col(ci_name):
         return next((c for c in cols if c.lower() == ci_name.lower()), None)
 
@@ -190,22 +167,21 @@ def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     cognome_col = find_col("Cognome")
     nome_col = find_col("Nome")
     data_col = find_col("Data")
-    turnoe_col = find_col("TurnoE") or find_col("Turno E") or find_col("turno_e")
+    # possibili varianti per TurnoE
+    turnoe_col = next((c for c in cols if c.lower().replace(" ", "") in ("turnoe", "turnoe", "turnoe")), None)
 
-    # Costruisci DataFrame risultato con le intestazioni desiderate
     result = pd.DataFrame()
-    result["Matricola"] = df2[matricola_col] if matricola_col else ""
-    result["Cognome"] = df2[cognome_col] if cognome_col else ""
-    result["Nome"] = df2[nome_col] if nome_col else ""
-    result["Data"] = df2[data_col] if data_col else ""
-    if giorno_source and giorno_source in df2.columns:
+    result["Matricola"] = df2[matricola_col] if matricola_col in df2.columns and matricola_col else ""
+    result["Cognome"] = df2[cognome_col] if cognome_col in df2.columns and cognome_col else ""
+    result["Nome"] = df2[nome_col] if nome_col in df2.columns and nome_col else ""
+    result["Data"] = df2[data_col] if data_col in df2.columns and data_col else ""
+    # Se giorno_source è definito e presente tra le colonne (anche se è ""), usalo; altrimenti crea vuoto
+    if giorno_source is not None and giorno_source in df2.columns:
         result["giorno"] = df2[giorno_source]
     else:
-        # crea colonna vuota se non trovata
         result["giorno"] = ""
-    result["TurnoE"] = df2[turnoe_col] if turnoe_col else ""
+    result["TurnoE"] = df2[turnoe_col] if turnoe_col in df2.columns and turnoe_col else ""
 
-    # Garantiamo l'ordine corretto e ritornamo
     return result[["Matricola", "Cognome", "Nome", "Data", "giorno", "TurnoE"]]
 
 def clean_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
@@ -213,17 +189,15 @@ def clean_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
     df_clean.columns = [c.strip() if isinstance(c, str) else c for c in df_clean.columns]
     def _strip_val(x):
         return x.strip() if isinstance(x, str) else x
-    # applymap può essere costoso su grandi file, ma qui ci serve per pulire spazi
     df_clean = df_clean.applymap(_strip_val)
     return df_clean
 
 if uploaded_file is not None:
     raw = uploaded_file.read()
     # 1) prova come vero excel
-    df_excel, info = try_read_excel(raw)
+    df_excel = try_read_excel(raw)
     if df_excel is not None:
-        st.success(f"File letto come {info}")
-        # pulizia di base e selezione colonne richieste
+        # excel vero: pulisco e mostro solo colonne richieste
         df_excel = clean_dataframe_strings(df_excel)
         df_sel = select_required_columns(df_excel)
         st.subheader("Anteprima (prime 19 righe) — colonne richieste")
@@ -236,58 +210,20 @@ if uploaded_file is not None:
             mime="text/csv",
         )
     else:
-        # 2) file testuale: genera candidati encodings
-        st.info("File riconosciuto come testo. Provo diverse decodifiche...")
-        candidates = generate_encoding_candidates(raw, n_top=8)
-        detected_enc, detected_conf = detect_with_chardet(raw)
+        # file testuale: rileviamo automaticamente encoding/separatore ma NON mostriamo la lista di candidati
+        candidates = generate_encoding_candidates(raw, n_top=4)
+        detected_enc, _ = detect_with_chardet(raw)
+        top_enc = candidates[0]["encoding"] if candidates else (detected_enc or "utf-8")
+        # snippet per guess separator se disponibile
+        snippet = candidates[0]["snippet"] if candidates else (raw.decode("latin1", errors="replace")[:1000])
+        guessed_sep = guess_separator_from_text(snippet)
 
-        st.subheader("Decodifiche candidate (scegli quella che mostra intestazioni leggibili)")
-        enc_options = []
-        for i, c in enumerate(candidates):
-            label = f"{i+1}) {c['encoding']} — score={c['score']} — non_print={c['non_print']}"
-            enc_options.append((label, c))
+        # campi per forzare encoding/separatore (ma senza mostrare candidati)
+        manual_enc = st.text_input("Forza encoding (lascia vuoto per rilevamento automatico)", value="")
+        manual_sep = st.text_input("Forza separatore (es. '\\t' o ';' o ',' o '\\\\s+' per whitespace)", value=guessed_sep)
 
-        labels = [lab for lab, _ in enc_options]
-
-        chosen = None
-        guessed_sep = r"\s+"
-        if labels:
-            sel_idx = st.radio(
-                "Decodifiche trovate (anteprima snippet):",
-                options=list(range(len(labels))),
-                format_func=lambda i: labels[i],
-            )
-            chosen = enc_options[sel_idx][1]
-            st.markdown(f"**Encoding suggerito:** {chosen['encoding']}  — punteggio: {chosen['score']}")
-            st.code(chosen['snippet'][:1000], language="text")
-            guessed_sep = guess_separator_from_text(chosen["snippet"])
-            st.write(f"Separatore suggerito: '{guessed_sep}'")
-        else:
-            st.write("Nessuna decodifica candidata trovata.")
-            try:
-                sample_text = raw.decode("latin1")
-                guessed_sep = guess_separator_from_text(sample_text)
-            except Exception:
-                guessed_sep = r"\s+"
-
-        st.markdown("---")
-        st.subheader("Opzioni manuali / prova diretta")
-        manual_enc = st.text_input("Forza encoding (lascia vuoto per usare la selezione sopra)", value="")
-        if manual_enc.strip():
-            enc_to_use = manual_enc.strip()
-        elif chosen:
-            enc_to_use = chosen["encoding"]
-        elif detected_enc:
-            enc_to_use = detected_enc
-        else:
-            enc_to_use = "utf-8"
-        st.write(f"Encoding selezionato per il parsing: {enc_to_use}")
-
-        manual_sep = st.text_input(
-            "Forza separatore (es. '\\t' o ';' o ',' o '\\\\s+' per whitespace)",
-            value=(guessed_sep if guessed_sep else "\\s+"),
-        )
-        st.write(f"Separatore usato per il parsing: {manual_sep}")
+        enc_to_use = manual_enc.strip() if manual_enc.strip() else top_enc
+        sep_to_use = manual_sep.strip() if manual_sep.strip() else guessed_sep
 
         try:
             decoded_full = raw.decode(enc_to_use)
@@ -295,11 +231,8 @@ if uploaded_file is not None:
             decoded_full = raw.decode(enc_to_use, errors="replace")
 
         try:
-            # usa il parser robusto per generare DataFrame
-            df = robust_read_text_to_df(decoded_full, manual_sep)
-            st.success("Lettura testo -> DataFrame avvenuta con successo (parser robusto)")
+            df = robust_read_text_to_df(decoded_full, sep_to_use)
             df = clean_dataframe_strings(df)
-            # seleziona solo le colonne richieste
             df_sel = select_required_columns(df)
             st.subheader("Anteprima (prime 19 righe) — colonne richieste")
             st.dataframe(df_sel.head(19))
@@ -311,8 +244,7 @@ if uploaded_file is not None:
                 mime="text/csv",
             )
         except Exception as e:
-            st.error(f"Impossibile convertire il testo in tabella: {e}")
-            st.markdown("Mostro un'anteprima testuale dello stream decodificato per debug:")
-            st.code(decoded_full[:2000], language="text")
+            st.error("Impossibile convertire il file in tabella.")
+            st.write("Errore tecnico:", str(e))
 else:
     st.info("Carica un file per iniziare.")
