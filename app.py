@@ -46,7 +46,7 @@ def score_decoded_text(text: str) -> int:
     # conta occorrenze delle parole chiave
     for kw in KEYWORDS:
         score += t.count(kw.lower())
-    # penalizza caratteri di replacement o troppi caratteri non-ASCII visuali 
+    # penalizza caratteri di replacement o troppi caratteri non-ASCII di controllo
     score -= text.count("�") * 5
     return score
 
@@ -62,7 +62,6 @@ def generate_encoding_candidates(raw_bytes: bytes, n_top=6):
     detected_enc, conf = detect_with_chardet(raw_bytes)
     candidates = list(ENC_CANDIDATES)
     if detected_enc:
-        # metti in testa la rilevata (ma senza duplicati)
         detected_enc = detected_enc.lower()
         if detected_enc not in candidates:
             candidates.insert(0, detected_enc)
@@ -145,6 +144,7 @@ if uploaded_file is not None:
         # 2) file testuale: genera candidati encodings
         st.info("File riconosciuto come testo. Provo diverse decodifiche...")
         candidates = generate_encoding_candidates(raw, n_top=8)
+        detected_enc, detected_conf = detect_with_chardet(raw)
 
         st.subheader("Decodifiche candidate (scegli quella che mostra intestazioni leggibili)")
         # mostra elenco con snippet e punteggio
@@ -153,28 +153,46 @@ if uploaded_file is not None:
             label = f"{i+1}) {c['encoding']} — score={c['score']} — non_print={c['non_print']}"
             enc_options.append((label, c))
 
-        # prepariamo visuale radio
         labels = [lab for lab, _ in enc_options]
-        sel_idx = st.radio("Decodifiche trovate (anteprima snippet):", options=list(range(len(labels))), format_func=lambda i: labels[i]) if labels else None)
 
+        chosen = None
+        guessed_sep = r"\s+"
         if labels:
+            sel_idx = st.radio(
+                "Decodifiche trovate (anteprima snippet):",
+                options=list(range(len(labels))),
+                format_func=lambda i: labels[i]
+            )
             chosen = enc_options[sel_idx][1]
             st.markdown(f"**Encoding suggerito:** {chosen['encoding']}  — punteggio: {chosen['score']}")
             st.code(chosen['snippet'][:1000], language="text")
-            # suggerisci separatore
             guessed_sep = guess_separator_from_text(chosen["snippet"])
             st.write(f"Separatore suggerito: '{guessed_sep}'")
         else:
             st.write("Nessuna decodifica candidata trovata.")
+            # default separator guess from raw sniff using latin1 fallback
+            try:
+                sample_text = raw.decode("latin1")
+                guessed_sep = guess_separator_from_text(sample_text)
+            except Exception:
+                guessed_sep = r"\s+"
 
         # opzioni manuali
         st.markdown("---")
         st.subheader("Opzioni manuali / prova diretta")
         manual_enc = st.text_input("Forza encoding (lascia vuoto per usare la selezione sopra)", value="")
-        enc_to_use = manual_enc.strip() if manual_enc.strip() else (chosen["encoding"] if labels else "utf-8")
+        # se l'utente non forza, usa chosen se presente, altrimenti usa chardet detected, altrimenti utf-8
+        if manual_enc.strip():
+            enc_to_use = manual_enc.strip()
+        elif chosen:
+            enc_to_use = chosen["encoding"]
+        elif detected_enc:
+            enc_to_use = detected_enc
+        else:
+            enc_to_use = "utf-8"
         st.write(f"Encoding selezionato per il parsing: {enc_to_use}")
 
-        manual_sep = st.text_input("Forza separatore (es. '\\t' o ';' o ',' o '\\\\s+' per whitespace)", value=(guessed_sep if labels else "\\s+"))
+        manual_sep = st.text_input("Forza separatore (es. '\\t' o ';' o ',' o '\\\\s+' per whitespace)", value=(guessed_sep if guessed_sep else "\\s+"))
         st.write(f"Separatore usato per il parsing: {manual_sep}")
 
         # decode full text con l'encoding scelto (con fallback permissivo)
