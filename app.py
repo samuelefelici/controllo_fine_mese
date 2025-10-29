@@ -1,94 +1,151 @@
 # app.py
 import streamlit as st
 import pandas as pd
-from io import BytesIO
+from io import BytesIO, StringIO
+import csv
 
 st.set_page_config(page_title="Controllo Paghe", layout="wide")
 st.title("Controllo Paghe")
 
-st.markdown("Carica un file Excel (.xls o .xlsx). Verrà mostrata un'anteprima delle prime 19 righe e potrai scaricare una versione pulita in CSV.")
+st.markdown("Carica un file (anche se ha estensione .xls/.xlsx ma è in realtà un file di testo). L'app proverà a rilevarne il formato e mostrerà le prime 19 righe.")
 
-uploaded_file = st.file_uploader("Carica file Excel", type=["xls", "xlsx"])
+uploaded_file = st.file_uploader("Carica file (xls, xlsx o file testo salvato come .xls)", type=["xls", "xlsx", "csv", "txt"])
 
-def read_excel_file(uploaded):
-    # Scegli engine in base all'estensione (xlrd per .xls, openpyxl per .xlsx)
-    name = uploaded.name.lower()
-    if name.endswith(".xls"):
-        engine = "xlrd"
-    else:
-        engine = "openpyxl"
+def try_read_excel(raw_bytes):
     try:
-        # sheet_name=None -> ritorna un dict {sheet_name: DataFrame}
-        with st.spinner("Leggo il file..."):
-            sheets = pd.read_excel(uploaded, sheet_name=None, engine=engine)
-        return sheets
-    except Exception as e:
-        st.error(f"Errore nella lettura del file: {e}")
-        return None
+        sheets = pd.read_excel(BytesIO(raw_bytes), sheet_name=None, engine=None)
+        # Se è un dict (più fogli), prendi il primo foglio per la preview
+        if isinstance(sheets, dict):
+            first_sheet = list(sheets.keys())[0]
+            return sheets[first_sheet], f"excel (foglio '{first_sheet}')"
+        return sheets, "excel"
+    except Exception:
+        return None, None
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    # Rimuove spazi nelle intestazioni e nelle celle stringa
-    df_clean = df.copy()
-    # strip colonne
-    df_clean.columns = [c.strip() if isinstance(c, str) else c for c in df_clean.columns]
-    # strip valori stringa
-    def _strip_val(x):
-        return x.strip() if isinstance(x, str) else x
-    df_clean = df_clean.applymap(_strip_val)
-    return df_clean
+def detect_text_format_and_read(raw_bytes):
+    # prova vari encoding comuni
+    encodings = ["utf-8", "utf-16", "cp1252", "latin1"]
+    text = None
+    used_enc = None
+    for enc in encodings:
+        try:
+            text = raw_bytes.decode(enc)
+            used_enc = enc
+            break
+        except Exception:
+            continue
+    if text is None:
+        # fallback permissivo
+        text = raw_bytes.decode("latin1", errors="replace")
+        used_enc = "latin1 (fallback, with replace)"
+
+    sample = text.lstrip()[:1000].lower()
+
+    # HTML?
+    if sample.startswith("<html") or "<table" in sample:
+        try:
+            dfs = pd.read_html(StringIO(text))
+            if dfs:
+                return dfs[0], f"html (parsed via read_html), encoding={used_enc}"
+        except Exception:
+            pass
+
+    # XML (Spreadsheet)?
+    if sample.startswith("<?xml"):
+        try:
+            # pandas.read_xml può funzionare per alcuni XML tabulari
+            df = pd.read_xml(StringIO(text))
+            return df, f"xml, encoding={used_enc}"
+        except Exception:
+            pass
+
+    # SYLK (starts with ID;)
+    if sample.startswith("id;"):
+        try:
+            df = pd.read_csv(StringIO(text), sep=";", engine="python", encoding=used_enc)
+            return df, f"sylk-like (read as ;-sep), encoding={used_enc}"
+        except Exception:
+            pass
+
+    # Prova a sniffare il separatore con csv.Sniffer
+    first_lines = "\n".join(text.splitlines()[:20])
+    try:
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(first_lines)
+        sep = dialect.delimiter
+        # se separatore è whitespace, preferiamo tab o comma
+        if sep.isspace():
+            sep = "\t"
+    except Exception:
+        # heuristics: prefer tab se contiene \t, altrimenti ; o ,
+        if "\t" in first_lines:
+            sep = "\t"
+        elif ";" in first_lines:
+            sep = ";"
+        elif "," in first_lines:
+            sep = ","
+        else:
+            # fallback: split by whitespace
+            sep = r"\s+"
+
+    # prova lettura con il separatore trovato, poi con altri comuni
+    tried = []
+    for sep_try in [sep, "\t", ";", ",", r"\s+"]:
+        if sep_try in tried:
+            continue
+        tried.append(sep_try)
+        try:
+            if sep_try == r"\s+":
+                df = pd.read_csv(StringIO(text), sep=r"\s+", engine="python", encoding=used_enc)
+            else:
+                df = pd.read_csv(StringIO(text), sep=sep_try, engine="python", encoding=used_enc)
+            return df, f"text, sep='{sep_try}', encoding={used_enc}"
+        except Exception:
+            continue
+
+    # Se tutto fallisce, ritorna None
+    return None, f"unknown text format, tried encodings={encodings}"
+
+def detect_and_read(uploaded):
+    raw = uploaded.read()
+    # Reset file pointer not necessary perché abbiamo letto tutto in raw
+    # 1) prova come vero excel
+    df, info = try_read_excel(raw)
+    if df is not None:
+        return df, info
+    # 2) prova come testo/CSV/TSV/HTML/XML/SYLK
+    df, info = detect_text_format_and_read(raw)
+    return df, info
 
 if uploaded_file is not None:
-    sheets = read_excel_file(uploaded_file)
-    if sheets is None:
-        st.stop()
-
-    sheet_names = list(sheets.keys())
-    if len(sheet_names) > 1:
-        sheet_choice = st.selectbox("Seleziona foglio", sheet_names)
+    df, info = detect_and_read(uploaded_file)
+    if df is None:
+        st.error(f"Impossibile determinare/leggere il formato del file. Info rilevate: {info}")
     else:
-        sheet_choice = sheet_names[0]
+        st.success(f"File caricato. Formato rilevato: {info}")
+        st.subheader("Anteprima (prime 19 righe)")
+        try:
+            st.dataframe(df.head(19))
+        except Exception:
+            st.write(df.head(19))
 
-    df = sheets[sheet_choice]
+        # pulizia minima
+        def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+            df_clean = df.copy()
+            df_clean.columns = [c.strip() if isinstance(c, str) else c for c in df_clean.columns]
+            def _strip_val(x):
+                return x.strip() if isinstance(x, str) else x
+            df_clean = df_clean.applymap(_strip_val)
+            return df_clean
 
-    st.subheader(f"Anteprima del foglio: {sheet_choice}")
-    # Mostra prime 19 righe come richiesto
-    try:
-        st.dataframe(df.head(19))
-    except Exception:
-        # fallback semplice
-        st.write(df.head(19))
-
-    st.markdown("---")
-    st.subheader("Opzioni di pulizia e download")
-
-    do_clean = st.checkbox("Esegui pulizia base (rimuovi spazi nelle intestazioni e nelle celle stringa)", value=True)
-
-    if do_clean:
         df_clean = clean_dataframe(df)
-    else:
-        df_clean = df.copy()
-
-    st.write(f"Dimensione dati: {df_clean.shape[0]} righe × {df_clean.shape[1]} colonne")
-    st.dataframe(df_clean.head(19))
-
-    # Bottone di download CSV
-    try:
-        csv_bytes = df_clean.to_csv(index=False).encode("utf-8-sig")
+        st.markdown("---")
+        st.write(f"Dimensione dati: {df_clean.shape[0]} righe × {df_clean.shape[1]} colonne")
         st.download_button(
             label="Scarica CSV pulito",
-            data=csv_bytes,
+            data=df_clean.to_csv(index=False).encode("utf-8-sig"),
             file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_pulito.csv",
             mime="text/csv",
         )
-    except Exception as e:
-        st.error(f"Impossibile preparare il download: {e}")
-
-    st.markdown("""
-    NOTE:
-    - Se il file ha formattazioni particolari (colonne unite, righe di intestazione multiple, celle con separatori particolari)
-      potrebbe essere necessario un parsing più avanzato: posso aggiungere opzioni per specificare quante righe usare come intestazione, 
-      unire colonne, o trasformare colonne orarie in durate.
-    - Il codice cerca automaticamente l'engine corretto per .xls/.xlsx ma assicurati di avere le dipendenze installate.
-    """)
 else:
-    st.info("Carica un file Excel per iniziare.")
+    st.info("Carica un file per iniziare.")
