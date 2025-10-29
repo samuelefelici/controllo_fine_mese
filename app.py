@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 from io import BytesIO, StringIO
@@ -17,12 +18,27 @@ try:
 except Exception:
     HAS_REPORTLAB = False
 
+# -------------------- Header / Logo display --------------------
 st.set_page_config(page_title="Controllo Paghe", layout="wide")
-st.title("Controllo Paghe")
 
-st.markdown(
-    "Carica il file Riepilogo Mensile per Excel - Dettagliato DB."
-)
+# show logo top-right if present, title on left
+base_path = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+logo_path = base_path / "Logo.png"
+
+col_left, col_right = st.columns([8, 2])
+with col_left:
+    st.title("Controllo Paghe")
+    st.markdown("Carica il file Riepilogo Mensile per Excel - Dettagliato DB.")
+with col_right:
+    if logo_path.exists():
+        try:
+            st.image(str(logo_path), use_column_width=True)
+        except Exception:
+            # fallback: try opening as bytes
+            try:
+                st.image(open(logo_path, "rb").read(), use_column_width=True)
+            except Exception:
+                pass
 
 # -------------------- utilities e parsing robusto (come prima) --------------------
 KEYWORDS = ["Residenza", "Matricola", "Cognome", "Nome", "Gruppo", "Data", "Turno", "Inizio", "Fine"]
