@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 from io import BytesIO, StringIO
@@ -5,23 +6,25 @@ import csv
 import chardet
 import re
 from pathlib import Path
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
 
 st.set_page_config(page_title="Controllo Paghe", layout="wide")
 st.title("Controllo Paghe")
 
 st.markdown(
     "Carica il file. Verranno mostrate in anteprima SOLO le colonne: Matricola, Cognome, Nome, Data, "
-    "giorno (colonna subito dopo Data) e TurnoE. Dopo aver selezionato le categorie di assenza, "
-    "l'app mostrerà per ciascuna categoria (selezionata) l'elenco dei conducenti e i giorni in cui hanno avuto quella tipologia."
+    "giorno (colonna subito dopo Data) e TurnoE. Poi scegli Mese/Anno e le Categorie da elaborare e clicca 'Elabora' "
+    "per ottenere un PDF con, per ciascuna categoria selezionata, l'elenco per conducente dei giorni trovati."
 )
 
-# ---------- configurazioni / utility ----------
+# -------------------- utilities e parsing robusto (come prima) --------------------
 KEYWORDS = ["Residenza", "Matricola", "Cognome", "Nome", "Gruppo", "Data", "Turno", "Inizio", "Fine"]
 ENC_CANDIDATES = [
     "utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
     "cp1252", "iso-8859-1", "latin1", "cp1250",
 ]
-
 TOKEN_RE = re.compile(r"[A-Za-z0-9/\.]+")  # token extractor per TurnoE
 
 
@@ -154,7 +157,50 @@ def clean_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
     return df_clean
 
 
-# ---------- codes.csv loader ----------
+# -------------------- gestione colonne richieste --------------------
+def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    cols = [str(c).strip() if c is not None else "" for c in df2.columns]
+    df2.columns = cols
+
+    idx_data = next((i for i, c in enumerate(cols) if c.lower() == "data"), None)
+
+    giorno_source = None
+    if idx_data is not None and (idx_data + 1) < len(cols):
+        giorno_source = cols[idx_data + 1]
+
+    if giorno_source is None:
+        empty_col = next((c for c in cols if c == ""), None)
+        if empty_col is not None:
+            giorno_source = empty_col
+        else:
+            daycol = next((c for c in cols if c.lower() == "giorno"), None)
+            if daycol is not None:
+                giorno_source = daycol
+
+    def find_col(ci_name):
+        return next((c for c in cols if c.lower() == ci_name.lower()), None)
+
+    matricola_col = find_col("Matricola")
+    cognome_col = find_col("Cognome")
+    nome_col = find_col("Nome")
+    data_col = find_col("Data")
+    turnoe_col = next((c for c in cols if c.lower().replace(" ", "") in ("turnoe", "turnoe", "turnoe")), None)
+
+    result = pd.DataFrame()
+    result["Matricola"] = df2[matricola_col] if matricola_col in df2.columns and matricola_col else ""
+    result["Cognome"] = df2[cognome_col] if cognome_col in df2.columns and cognome_col else ""
+    result["Nome"] = df2[nome_col] if nome_col in df2.columns and nome_col else ""
+    result["Data"] = df2[data_col] if data_col in df2.columns and data_col else ""
+    if giorno_source is not None and giorno_source in df2.columns:
+        result["giorno"] = df2[giorno_source]
+    else:
+        result["giorno"] = ""
+    result["TurnoE"] = df2[turnoe_col] if turnoe_col in df2.columns and turnoe_col else ""
+    return result[["Matricola", "Cognome", "Nome", "Data", "giorno", "TurnoE"]]
+
+
+# -------------------- codes.csv loader --------------------
 def load_codes_file() -> dict:
     base = Path(__file__).parent if "__file__" in globals() else Path.cwd()
     candidates = [base / "codes.csv", Path.cwd() / "codes.csv"]
@@ -201,50 +247,81 @@ def extract_matched_codes(cell_value: str, normalized_code_map: dict):
     return matched
 
 
-# ---------- selezione colonne richieste ----------
-def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df2 = df.copy()
-    cols = [str(c).strip() if c is not None else "" for c in df2.columns]
-    df2.columns = cols
+# -------------------- PDF generation --------------------
+def generate_pdf_for_categories(category_results: dict, month_name: str, year: str) -> bytes:
+    """
+    category_results: dict category -> DataFrame (with columns Matricola,Cognome,Nome,Data,giorno,TurnoE_matched,_sort_data)
+    Restituisce PDF bytes in memoria con struttura:
+    [Header Category Month Year]
+    [Per each driver: title Matricola Cognome Nome]
+    [li: giorno Data CODE]
+    """
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    margin = 20 * mm
+    y = height - margin
+    line_height = 5.5 * mm
+    title_space = 9 * mm
 
-    idx_data = next((i for i, c in enumerate(cols) if c.lower() == "data"), None)
+    def new_page():
+        nonlocal y
+        c.showPage()
+        y = height - margin
 
-    giorno_source = None
-    if idx_data is not None and (idx_data + 1) < len(cols):
-        giorno_source = cols[idx_data + 1]
+    for cat, df_cat in category_results.items():
+        # Header for category
+        title_text = f"{cat}  {month_name} {year}"
+        c.setFont("Helvetica-Bold", 14)
+        if y < margin + title_space:
+            new_page()
+        c.drawString(margin, y, title_text)
+        y -= title_space
 
-    if giorno_source is None:
-        empty_col = next((c for c in cols if c == ""), None)
-        if empty_col is not None:
-            giorno_source = empty_col
-        else:
-            daycol = next((c for c in cols if c.lower() == "giorno"), None)
-            if daycol is not None:
-                giorno_source = daycol
+        # group by matricola
+        if df_cat.empty:
+            c.setFont("Helvetica-Oblique", 10)
+            if y < margin + line_height:
+                new_page()
+            c.drawString(margin + 5 * mm, y, "Nessuna occorrenza trovata per questa categoria.")
+            y -= line_height
+            continue
 
-    def find_col(ci_name):
-        return next((c for c in cols if c.lower() == ci_name.lower()), None)
+        for mat, group in df_cat.groupby("Matricola", sort=False):
+            first = group.iloc[0]
+            cogn = first.get("Cognome", "")
+            nom = first.get("Nome", "")
+            header_line = f"{mat}  {cogn} {nom}"
+            c.setFont("Helvetica-Bold", 11)
+            if y < margin + line_height * 4:
+                new_page()
+            c.drawString(margin + 3 * mm, y, header_line)
+            y -= line_height
 
-    matricola_col = find_col("Matricola")
-    cognome_col = find_col("Cognome")
-    nome_col = find_col("Nome")
-    data_col = find_col("Data")
-    turnoe_col = next((c for c in cols if c.lower().replace(" ", "") in ("turnoe", "turnoe", "turnoe")), None)
+            grp_sorted = group.sort_values("_sort_data")
+            c.setFont("Helvetica", 10)
+            for _, row in grp_sorted.iterrows():
+                giorno = str(row.get("giorno", "")).strip()
+                data_val = row.get("Data", "")
+                turno_code = row.get("TurnoE_matched", "")
+                line_text = f"{giorno} {data_val} {turno_code}".strip()
+                if y < margin + line_height:
+                    new_page()
+                c.drawString(margin + 10 * mm, y, line_text)
+                y -= line_height
 
-    result = pd.DataFrame()
-    result["Matricola"] = df2[matricola_col] if matricola_col in df2.columns and matricola_col else ""
-    result["Cognome"] = df2[cognome_col] if cognome_col in df2.columns and cognome_col else ""
-    result["Nome"] = df2[nome_col] if nome_col in df2.columns and nome_col else ""
-    result["Data"] = df2[data_col] if data_col in df2.columns and data_col else ""
-    if giorno_source is not None and giorno_source in df2.columns:
-        result["giorno"] = df2[giorno_source]
-    else:
-        result["giorno"] = ""
-    result["TurnoE"] = df2[turnoe_col] if turnoe_col in df2.columns and turnoe_col else ""
-    return result[["Matricola", "Cognome", "Nome", "Data", "giorno", "TurnoE"]]
+            # post-driver spacing
+            y -= 1.5 * mm
+
+        # after each category add a page break (start next category on new page)
+        new_page()
+
+    c.save()
+    buffer.seek(0)
+    return buffer.read()
 
 
-# ---------- UI e flusso ----------
+# -------------------- UI principale --------------------
 uploaded_file = st.file_uploader(
     "Carica file (xls, xlsx, csv, txt - anche se ha estensione .xls)",
     type=["xls", "xlsx", "csv", "txt"],
@@ -257,8 +334,16 @@ categories_available = sorted(list(codes_map.keys())) if codes_map else []
 if not categories_available:
     st.warning("Attenzione: non è stato trovato 'codes.csv' nella repo. Le categorie non saranno disponibili.")
 else:
-    st.markdown("Seleziona le categorie di assenza da visualizzare (verranno mostrate SEPARATAMENTE, una categoria dopo l'altra):")
+    st.markdown("Seleziona le categorie di assenza da visualizzare (verranno elaborate SEPARATAMENTE, una categoria dopo l'altra):")
     chosen_categories = st.multiselect("Categorie", options=categories_available, default=[])
+
+# Mese e Anno input
+mesi = [
+    "Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
+    "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"
+]
+mese_scelto = st.selectbox("Mese", options=mesi, index=9)  # default Ottobre (index 9) - puoi cambiare
+anno_input = st.text_input("Anno", value=str(pd.Timestamp.now().year))
 
 if uploaded_file is None:
     st.info("Carica un file per iniziare.")
@@ -308,66 +393,59 @@ if not categories_available:
     st.stop()
 
 if not chosen_categories:
-    st.info("Seleziona una o più categorie per visualizzare gli elenchi per categoria.")
+    st.info("Seleziona una o più categorie per poter generare il PDF.")
     st.stop()
 
-# --- per ogni categoria selezionata: costruisco e mostro il risultato separatamente ---
-for cat in chosen_categories:
-    st.markdown("---")
-    st.header(f"Categoria: {cat}")
-    # costruisco set dei codici normalizzati per questa singola categoria
-    selected_norm_codes = set()
-    for code in codes_map.get(cat, []):
-        norm = re.sub(r'[^A-Za-z0-9]', '', code).upper()
-        if norm:
-            selected_norm_codes.add(norm)
+# bottone Elabora
+if st.button("Elabora"):
+    # per ogni categoria selezionata produciamo il dataframe result_df (come prima) e lo memorizziamo in dict
+    category_results = {}
+    for cat in chosen_categories:
+        selected_norm_codes = set()
+        for code in codes_map.get(cat, []):
+            norm = re.sub(r'[^A-Za-z0-9]', '', code).upper()
+            if norm:
+                selected_norm_codes.add(norm)
 
-    rows = []
-    for _, r in df_sel.iterrows():
-        turno_cell = r.get("TurnoE", "")
-        matched = extract_matched_codes(turno_cell, normalized_code_map)
-        matched_selected = [m for m in matched if m[1] in selected_norm_codes]
-        if matched_selected:
-            matched_tokens = [m[0] for m in matched_selected]
-            rows.append({
-                "Matricola": r.get("Matricola", ""),
-                "Cognome": r.get("Cognome", ""),
-                "Nome": r.get("Nome", ""),
-                "Data": r.get("Data", ""),
-                "giorno": r.get("giorno", ""),
-                "TurnoE_matched": " ".join(matched_tokens),
-                "_sort_data": r.get("_sort_data")
-            })
+        rows = []
+        for _, r in df_sel.iterrows():
+            turno_cell = r.get("TurnoE", "")
+            matched = extract_matched_codes(turno_cell, normalized_code_map)
+            matched_selected = [m for m in matched if m[1] in selected_norm_codes]
+            if matched_selected:
+                matched_tokens = [m[0] for m in matched_selected]
+                rows.append({
+                    "Matricola": r.get("Matricola", ""),
+                    "Cognome": r.get("Cognome", ""),
+                    "Nome": r.get("Nome", ""),
+                    "Data": r.get("Data", ""),
+                    "giorno": r.get("giorno", ""),
+                    "TurnoE_matched": " ".join(matched_tokens),
+                    "_sort_data": r.get("_sort_data")
+                })
 
-    if not rows:
-        st.write(f"Nessuna occorrenza trovata per la categoria '{cat}'.")
-        continue
+        if not rows:
+            # salva empty DF per categoria (gestito in PDF)
+            category_results[cat] = pd.DataFrame(columns=["Matricola", "Cognome", "Nome", "Data", "giorno", "TurnoE_matched", "_sort_data"])
+            continue
 
-    result_df = pd.DataFrame(rows)
+        result_df = pd.DataFrame(rows)
 
-    # ordina per matricola (numerica se possibile) e data crescente
-    def matricola_sort_key(v):
-        try:
-            return int(str(v).strip())
-        except Exception:
-            return str(v).zfill(10)
+        def matricola_sort_key(v):
+            try:
+                return int(str(v).strip())
+            except Exception:
+                return str(v).zfill(10)
 
-    result_df["_mat_sort"] = result_df["Matricola"].apply(matricola_sort_key)
-    result_df = result_df.sort_values(by=["_mat_sort", "_sort_data"])
+        result_df["_mat_sort"] = result_df["Matricola"].apply(matricola_sort_key)
+        result_df = result_df.sort_values(by=["_mat_sort", "_sort_data"])
+        category_results[cat] = result_df
 
-    # raggruppa e mostra per dipendente
-    for mat, group in result_df.groupby("Matricola", sort=False):
-        first = group.iloc[0]
-        cogn = first.get("Cognome", "")
-        nom = first.get("Nome", "")
-        st.subheader(f"{mat}  {cogn} {nom}")
-        grp_sorted = group.sort_values("_sort_data")
-        for _, row in grp_sorted.iterrows():
-            giorno = str(row.get("giorno", "")).strip()
-            data_val = row.get("Data", "")
-            turno_code = row.get("TurnoE_matched", "")
-            st.text(f"{giorno} {data_val} {turno_code}")
-
-    # download CSV per categoria
-    csv_bytes = result_df.drop(columns=["_mat_sort", "_sort_data"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
-    st.download_button(f"Scarica CSV per categoria '{cat}'", csv_bytes, file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_{cat}_assenze.csv", mime="text/csv")
+    # Genera PDF in memoria
+    try:
+        pdf_bytes = generate_pdf_for_categories(category_results, mese_scelto, anno_input)
+        fname = f"{uploaded_file.name.rsplit('.',1)[0]}_{mese_scelto}_{anno_input}_assenze.pdf"
+        st.success("PDF generato correttamente.")
+        st.download_button("Scarica PDF", data=pdf_bytes, file_name=fname, mime="application/pdf")
+    except Exception as e:
+        st.error(f"Errore nella generazione del PDF: {e}")
