@@ -12,26 +12,35 @@ st.title("Controllo Paghe")
 st.markdown(
     "Carica il file. Verranno mostrate in anteprima SOLO le colonne: Matricola, Cognome, Nome, Data, "
     "giorno (colonna subito dopo Data) e TurnoE. Dopo aver selezionato le categorie di assenza, "
-    "l'app mostra per ogni dipendente i giorni (in ordine crescente) in cui ha avuto quella tipologia."
+    "l'app mostrerà per ciascuna categoria (selezionata) l'elenco dei conducenti e i giorni in cui hanno avuto quella tipologia."
 )
 
-# ---------- utility per parsing file (riporto funzioni robuste già usate) ----------
+# ---------- configurazioni / utility ----------
 KEYWORDS = ["Residenza", "Matricola", "Cognome", "Nome", "Gruppo", "Data", "Turno", "Inizio", "Fine"]
 ENC_CANDIDATES = [
     "utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
     "cp1252", "iso-8859-1", "latin1", "cp1250",
 ]
 
+TOKEN_RE = re.compile(r"[A-Za-z0-9/\.]+")  # token extractor per TurnoE
+
 
 def try_read_excel(raw_bytes):
     try:
         sheets = pd.read_excel(BytesIO(raw_bytes), sheet_name=None, engine=None)
         if isinstance(sheets, dict):
-            first = list(sheets.keys())[0]
-            return sheets[first]
+            return list(sheets.values())[0]
         return sheets
     except Exception:
         return None
+
+
+def detect_with_chardet(raw_bytes: bytes):
+    try:
+        res = chardet.detect(raw_bytes)
+        return res.get("encoding"), res.get("confidence", 0.0)
+    except Exception:
+        return None, 0.0
 
 
 def score_decoded_text(text: str) -> int:
@@ -43,24 +52,16 @@ def score_decoded_text(text: str) -> int:
     return score
 
 
-def detect_with_chardet(raw_bytes: bytes):
-    try:
-        res = chardet.detect(raw_bytes)
-        return res.get("encoding"), res.get("confidence", 0.0)
-    except Exception:
-        return None, 0.0
-
-
 def generate_encoding_candidates(raw_bytes: bytes, n_top=4):
     detected_enc, _ = detect_with_chardet(raw_bytes)
     candidates = list(ENC_CANDIDATES)
     if detected_enc:
-        detected_enc = detected_enc.lower()
-        if detected_enc not in candidates:
-            candidates.insert(0, detected_enc)
+        de = detected_enc.lower()
+        if de not in candidates:
+            candidates.insert(0, de)
         else:
-            candidates.remove(detected_enc)
-            candidates.insert(0, detected_enc)
+            candidates.remove(de)
+            candidates.insert(0, de)
 
     sample_bytes = raw_bytes[:8000]
     scored = []
@@ -144,15 +145,70 @@ def robust_read_text_to_df(decoded_text: str, sep_choice: str):
     return df
 
 
+def clean_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
+    df_clean = df.copy()
+    df_clean.columns = [c.strip() if isinstance(c, str) else c for c in df_clean.columns]
+    def _strip_val(x):
+        return x.strip() if isinstance(x, str) else x
+    df_clean = df_clean.applymap(_strip_val)
+    return df_clean
+
+
+# ---------- codes.csv loader ----------
+def load_codes_file() -> dict:
+    base = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+    candidates = [base / "codes.csv", Path.cwd() / "codes.csv"]
+    for p in candidates:
+        if p.exists():
+            try:
+                codes_df = pd.read_csv(p)
+                mapping = {}
+                for _, r in codes_df.iterrows():
+                    cat = str(r["Category"]).strip()
+                    codes_raw = str(r["Codes"]).strip() if not pd.isna(r["Codes"]) else ""
+                    codes = [c.strip() for c in codes_raw.split(";") if c.strip() != ""]
+                    mapping[cat] = codes
+                return mapping
+            except Exception:
+                return {}
+    return {}
+
+
+def build_normalized_code_map(codes_map: dict) -> dict:
+    norm_map = {}
+    for cat, codes in codes_map.items():
+        for code in codes:
+            norm = re.sub(r'[^A-Za-z0-9]', '', code).upper()
+            if not norm:
+                continue
+            norm_map.setdefault(norm, []).append(cat)
+    return norm_map
+
+
+def extract_matched_codes(cell_value: str, normalized_code_map: dict):
+    if not cell_value or str(cell_value).strip() == "":
+        return []
+    text = str(cell_value)
+    tokens = TOKEN_RE.findall(text)
+    matched = []
+    for tok in tokens:
+        norm = re.sub(r'[^A-Za-z0-9]', '', tok).upper()
+        if not norm:
+            continue
+        cats = normalized_code_map.get(norm)
+        if cats:
+            matched.append((tok.strip(), norm, cats))
+    return matched
+
+
+# ---------- selezione colonne richieste ----------
 def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df.copy()
     cols = [str(c).strip() if c is not None else "" for c in df2.columns]
     df2.columns = cols
 
-    # trova indice della colonna 'Data' (case-insensitive)
     idx_data = next((i for i, c in enumerate(cols) if c.lower() == "data"), None)
 
-    # se 'Data' trovata, prendiamo la colonna immediatamente dopo (anche se ha intestazione vuota)
     giorno_source = None
     if idx_data is not None and (idx_data + 1) < len(cols):
         giorno_source = cols[idx_data + 1]
@@ -188,83 +244,7 @@ def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     return result[["Matricola", "Cognome", "Nome", "Data", "giorno", "TurnoE"]]
 
 
-def clean_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
-    df_clean = df.copy()
-    df_clean.columns = [c.strip() if isinstance(c, str) else c for c in df_clean.columns]
-    def _strip_val(x):
-        return x.strip() if isinstance(x, str) else x
-    df_clean = df_clean.applymap(_strip_val)
-    return df_clean
-
-
-# ---------- read codes.csv (categorie -> codici) ----------
-def load_codes_file() -> dict:
-    """
-    Cerca codes.csv nella stessa cartella dello script (o nella cwd) e ritorna
-    un dizionario {Category: [codes...]}. Se non esiste, ritorna dizionario vuoto.
-    """
-    # prova path relativo allo script
-    base = Path(__file__).parent if "__file__" in globals() else Path.cwd()
-    candidates = [base / "codes.csv", Path.cwd() / "codes.csv"]
-    for p in candidates:
-        if p.exists():
-            try:
-                codes_df = pd.read_csv(p)
-                # ci aspettiamo colonne Category,Codes
-                mapping = {}
-                for _, r in codes_df.iterrows():
-                    cat = str(r["Category"]).strip()
-                    codes_raw = str(r["Codes"]).strip() if not pd.isna(r["Codes"]) else ""
-                    # split by ; e rimuovi spazi
-                    codes = [c.strip() for c in codes_raw.split(";") if c.strip() != ""]
-                    mapping[cat] = codes
-                return mapping
-            except Exception:
-                return {}
-    return {}
-
-
-def build_normalized_code_map(codes_map: dict) -> dict:
-    """
-    Ritorna mapping_normalized_code -> [categories...]
-    Normalizzazione: rimuove caratteri non alphanum e uppercase.
-    Es F1/2 -> F12 (chiave normalizzata)
-    """
-    norm_map = {}
-    for cat, codes in codes_map.items():
-        for code in codes:
-            norm = re.sub(r'[^A-Za-z0-9]', '', code).upper()
-            if not norm:
-                continue
-            norm_map.setdefault(norm, []).append(cat)
-    return norm_map
-
-
-# ---------- funzione per estrarre codici dalla cella TurnoE ----------
-TOKEN_RE = re.compile(r"[A-Za-z0-9/\.]+")  # includiamo slash e punto nelle tokens originali
-
-
-def extract_matched_codes(cell_value: str, normalized_code_map: dict):
-    """
-    Dalla stringa cell_value estrae i token e mappa contro normalized_code_map.
-    Ritorna lista di (original_token, normalized_token, [categories...])
-    """
-    if not cell_value or str(cell_value).strip() == "":
-        return []
-    text = str(cell_value)
-    tokens = TOKEN_RE.findall(text)
-    matched = []
-    for tok in tokens:
-        norm = re.sub(r'[^A-Za-z0-9]', '', tok).upper()
-        if not norm:
-            continue
-        cats = normalized_code_map.get(norm)
-        if cats:
-            matched.append((tok.strip(), norm, cats))
-    return matched
-
-
-# ---------- UI e flusso principale ----------
+# ---------- UI e flusso ----------
 uploaded_file = st.file_uploader(
     "Carica file (xls, xlsx, csv, txt - anche se ha estensione .xls)",
     type=["xls", "xlsx", "csv", "txt"],
@@ -272,21 +252,19 @@ uploaded_file = st.file_uploader(
 
 codes_map = load_codes_file()
 normalized_code_map = build_normalized_code_map(codes_map)
-
-# lista categorie da mostrare all'utente (solo quelle presenti nel file codes.csv)
 categories_available = sorted(list(codes_map.keys())) if codes_map else []
 
 if not categories_available:
     st.warning("Attenzione: non è stato trovato 'codes.csv' nella repo. Le categorie non saranno disponibili.")
 else:
-    st.markdown("Seleziona le categorie di assenza da visualizzare:")
+    st.markdown("Seleziona le categorie di assenza da visualizzare (verranno mostrate SEPARATAMENTE, una categoria dopo l'altra):")
     chosen_categories = st.multiselect("Categorie", options=categories_available, default=[])
 
 if uploaded_file is None:
     st.info("Carica un file per iniziare.")
     st.stop()
 
-# read uploaded file into dataframe with previous robust logic
+# lettura file (excel o testo) - detection automatica, senza mostrare candidate all'utente
 raw = uploaded_file.read()
 df_excel = try_read_excel(raw)
 if df_excel is not None:
@@ -304,18 +282,15 @@ else:
         decoded_full = raw.decode(enc_to_use, errors="replace")
     df = robust_read_text_to_df(decoded_full, sep_to_use)
 
-# pulizia e selezione colonne richieste
 df = clean_dataframe_strings(df)
 df_sel = select_required_columns(df)
 
-# convert Data column to sortable value
+# preparazione valore ordinabile per Data
 def sortable_date_value(v):
-    # prova int
     try:
         return int(str(v).strip())
     except Exception:
         pass
-    # prova format dd/mm/yyyy o yyyy-mm-dd
     try:
         dt = pd.to_datetime(v, dayfirst=True, errors="coerce")
         if pd.isna(dt):
@@ -326,85 +301,73 @@ def sortable_date_value(v):
 
 df_sel["_sort_data"] = df_sel["Data"].apply(sortable_date_value)
 
-# Se l'utente non ha selezionato categorie, mostriamo anteprima delle colonne richieste ma non dettagli delle assenze
-if not categories_available:
-    st.subheader("Anteprima (prime 19 righe) — colonne richieste")
-    st.dataframe(df_sel.head(19))
-    st.write("Impossibile proseguire con l'analisi delle categorie: manca codes.csv.")
-    st.stop()
-
 st.subheader("Anteprima (prime 19 righe) — colonne richieste")
 st.dataframe(df_sel.head(19))
 
-if not chosen_categories:
-    st.info("Seleziona una o più categorie nella casella 'Categorie' per vedere i dettagli per dipendente.")
+if not categories_available:
     st.stop()
 
-# Costruisco l'insieme dei codici normalizzati appartenenti alle categorie selezionate
-selected_norm_codes = set()
+if not chosen_categories:
+    st.info("Seleziona una o più categorie per visualizzare gli elenchi per categoria.")
+    st.stop()
+
+# --- per ogni categoria selezionata: costruisco e mostro il risultato separatamente ---
 for cat in chosen_categories:
+    st.markdown("---")
+    st.header(f"Categoria: {cat}")
+    # costruisco set dei codici normalizzati per questa singola categoria
+    selected_norm_codes = set()
     for code in codes_map.get(cat, []):
         norm = re.sub(r'[^A-Za-z0-9]', '', code).upper()
         if norm:
             selected_norm_codes.add(norm)
 
-# per ogni riga estraiamo matched codes e filtriamo
-rows = []
-for _, r in df_sel.iterrows():
-    turno_cell = r.get("TurnoE", "")
-    matched = extract_matched_codes(turno_cell, normalized_code_map)
-    # matched è lista di tuples (original_token, norm, [cats...])
-    # consideriamo match se uno dei norm appartiene a selected_norm_codes
-    matched_selected = [m for m in matched if m[1] in selected_norm_codes]
-    if matched_selected:
-        # prendiamo il primo matched_selected (manteniamo ordine delle tokens)
-        # ma è possibile avere più codici, in tal caso mostriamo tutti separati da spazio
-        matched_tokens = [m[0] for m in matched_selected]
-        rows.append({
-            "Matricola": r.get("Matricola", ""),
-            "Cognome": r.get("Cognome", ""),
-            "Nome": r.get("Nome", ""),
-            "Data": r.get("Data", ""),
-            "giorno": r.get("giorno", ""),
-            "TurnoE_matched": " ".join(matched_tokens),
-            "_sort_data": r.get("_sort_data")
-        })
+    rows = []
+    for _, r in df_sel.iterrows():
+        turno_cell = r.get("TurnoE", "")
+        matched = extract_matched_codes(turno_cell, normalized_code_map)
+        matched_selected = [m for m in matched if m[1] in selected_norm_codes]
+        if matched_selected:
+            matched_tokens = [m[0] for m in matched_selected]
+            rows.append({
+                "Matricola": r.get("Matricola", ""),
+                "Cognome": r.get("Cognome", ""),
+                "Nome": r.get("Nome", ""),
+                "Data": r.get("Data", ""),
+                "giorno": r.get("giorno", ""),
+                "TurnoE_matched": " ".join(matched_tokens),
+                "_sort_data": r.get("_sort_data")
+            })
 
-if not rows:
-    st.write("Nessuna occorrenza trovata per le categorie selezionate.")
-    st.stop()
+    if not rows:
+        st.write(f"Nessuna occorrenza trovata per la categoria '{cat}'.")
+        continue
 
-result_df = pd.DataFrame(rows)
+    result_df = pd.DataFrame(rows)
 
-# ordiniamo per matricola (numerica se possibile) e data crescente
-def matricola_sort_key(v):
-    try:
-        return int(str(v).strip())
-    except Exception:
-        return str(v).zfill(10)
+    # ordina per matricola (numerica se possibile) e data crescente
+    def matricola_sort_key(v):
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return str(v).zfill(10)
 
-result_df["_mat_sort"] = result_df["Matricola"].apply(matricola_sort_key)
-result_df = result_df.sort_values(by=["_mat_sort", "_sort_data"])
+    result_df["_mat_sort"] = result_df["Matricola"].apply(matricola_sort_key)
+    result_df = result_df.sort_values(by=["_mat_sort", "_sort_data"])
 
-# raggruppiamo per Matricola e stampiamo per ogni persona l'elenco ordinato di giorni
-st.header("Risultato — per dipendente")
-last_mat = None
-for mat, group in result_df.groupby("Matricola", sort=False):
-    # get first row for name
-    first = group.iloc[0]
-    cogn = first.get("Cognome", "")
-    nom = first.get("Nome", "")
-    st.subheader(f"{mat}  {cogn} {nom}")
-    # ordina il gruppo per _sort_data asc
-    grp_sorted = group.sort_values("_sort_data")
-    # stampa righe
-    for _, row in grp_sorted.iterrows():
-        giorno = str(row.get("giorno", "")).strip()
-        data_val = row.get("Data", "")
-        turno_code = row.get("TurnoE_matched", "")
-        # rendo la riga compatta come "Giorno Data CODICE"
-        st.text(f"{giorno} {data_val} {turno_code}")
+    # raggruppa e mostra per dipendente
+    for mat, group in result_df.groupby("Matricola", sort=False):
+        first = group.iloc[0]
+        cogn = first.get("Cognome", "")
+        nom = first.get("Nome", "")
+        st.subheader(f"{mat}  {cogn} {nom}")
+        grp_sorted = group.sort_values("_sort_data")
+        for _, row in grp_sorted.iterrows():
+            giorno = str(row.get("giorno", "")).strip()
+            data_val = row.get("Data", "")
+            turno_code = row.get("TurnoE_matched", "")
+            st.text(f"{giorno} {data_val} {turno_code}")
 
-# scarica risultato complessivo come CSV
-csv_bytes = result_df.drop(columns=["_mat_sort", "_sort_data"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
-st.download_button("Scarica risultato (tutte le occorrenze trovate)", csv_bytes, file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_assenze_selezionate.csv", mime="text/csv")
+    # download CSV per categoria
+    csv_bytes = result_df.drop(columns=["_mat_sort", "_sort_data"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
+    st.download_button(f"Scarica CSV per categoria '{cat}'", csv_bytes, file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_{cat}_assenze.csv", mime="text/csv")
