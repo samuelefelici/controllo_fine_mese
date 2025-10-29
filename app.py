@@ -32,11 +32,11 @@ with col_left:
 with col_right:
     if logo_path.exists():
         try:
-            st.image(str(logo_path), use_column_width=True)
+            st.image(str(logo_path), use_container_width=True)
         except Exception:
             # fallback: try opening as bytes
             try:
-                st.image(open(logo_path, "rb").read(), use_column_width=True)
+                st.image(open(logo_path, "rb").read(), use_container_width=True)
             except Exception:
                 pass
 
