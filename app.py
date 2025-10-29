@@ -22,9 +22,7 @@ st.set_page_config(page_title="Controllo Paghe", layout="wide")
 st.title("Controllo Paghe")
 
 st.markdown(
-    "Carica il file. Verranno mostrate in anteprima SOLO le colonne: Matricola, Cognome, Nome, Data, "
-    "giorno (colonna subito dopo Data) e TurnoE. Poi scegli Mese/Anno e le Categorie da elaborare e clicca 'Elabora' "
-    "per ottenere un PDF con, per ciascuna categoria selezionata, l'elenco per conducente dei giorni trovati."
+    "Carica il file Riepilogo Mensile per Excel - Dettagliato DB.Poi scegli le categorie di Assenza e Mese/Anno, poi clicca 'Elabora' "
 )
 
 # -------------------- utilities e parsing robusto (come prima) --------------------
