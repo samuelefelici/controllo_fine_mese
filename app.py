@@ -4,25 +4,24 @@ from io import BytesIO, StringIO
 import csv
 import chardet
 import re
+from pathlib import Path
 
 st.set_page_config(page_title="Controllo Paghe", layout="wide")
 st.title("Controllo Paghe")
 
 st.markdown(
     "Carica il file. Verranno mostrate in anteprima SOLO le colonne: Matricola, Cognome, Nome, Data, "
-    "giorno (colonna subito dopo Data) e TurnoE. Encoding e separatore sono rilevati automaticamente."
+    "giorno (colonna subito dopo Data) e TurnoE. Dopo aver selezionato le categorie di assenza, "
+    "l'app mostra per ogni dipendente i giorni (in ordine crescente) in cui ha avuto quella tipologia."
 )
 
-uploaded_file = st.file_uploader(
-    "Carica file (xls, xlsx, csv, txt - anche se ha estensione .xls)",
-    type=["xls", "xlsx", "csv", "txt"],
-)
-
+# ---------- utility per parsing file (riporto funzioni robuste già usate) ----------
 KEYWORDS = ["Residenza", "Matricola", "Cognome", "Nome", "Gruppo", "Data", "Turno", "Inizio", "Fine"]
 ENC_CANDIDATES = [
     "utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
     "cp1252", "iso-8859-1", "latin1", "cp1250",
 ]
+
 
 def try_read_excel(raw_bytes):
     try:
@@ -34,6 +33,7 @@ def try_read_excel(raw_bytes):
     except Exception:
         return None
 
+
 def score_decoded_text(text: str) -> int:
     t = text.lower()
     score = 0
@@ -42,12 +42,14 @@ def score_decoded_text(text: str) -> int:
     score -= text.count("�") * 5
     return score
 
+
 def detect_with_chardet(raw_bytes: bytes):
     try:
         res = chardet.detect(raw_bytes)
         return res.get("encoding"), res.get("confidence", 0.0)
     except Exception:
         return None, 0.0
+
 
 def generate_encoding_candidates(raw_bytes: bytes, n_top=4):
     detected_enc, _ = detect_with_chardet(raw_bytes)
@@ -76,6 +78,7 @@ def generate_encoding_candidates(raw_bytes: bytes, n_top=4):
     scored_sorted = sorted(scored, key=lambda x: (-x["score"], x["non_print"]))
     return scored_sorted[:n_top]
 
+
 def guess_separator_from_text(text: str):
     lines = "\n".join(text.splitlines()[:20])
     try:
@@ -95,6 +98,7 @@ def guess_separator_from_text(text: str):
             sep = r"\s+"
     return sep
 
+
 def parse_rows_with_sep(decoded_text: str, sep_choice: str):
     lines = [ln for ln in decoded_text.splitlines() if ln.strip() != ""]
     if not lines:
@@ -110,6 +114,7 @@ def parse_rows_with_sep(decoded_text: str, sep_choice: str):
         reader = csv.reader(lines, delimiter=delimiter)
         rows = [row for row in reader]
     return rows
+
 
 def robust_rows_to_df(rows):
     if not rows:
@@ -130,12 +135,14 @@ def robust_rows_to_df(rows):
     df = pd.DataFrame(processed, columns=header)
     return df
 
+
 def robust_read_text_to_df(decoded_text: str, sep_choice: str):
     rows = parse_rows_with_sep(decoded_text, sep_choice)
     if not rows:
         raise ValueError("Nessuna riga trovata nel testo.")
     df = robust_rows_to_df(rows)
     return df
+
 
 def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df.copy()
@@ -178,8 +185,8 @@ def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     else:
         result["giorno"] = ""
     result["TurnoE"] = df2[turnoe_col] if turnoe_col in df2.columns and turnoe_col else ""
-
     return result[["Matricola", "Cognome", "Nome", "Data", "giorno", "TurnoE"]]
+
 
 def clean_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
     df_clean = df.copy()
@@ -189,55 +196,215 @@ def clean_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
     df_clean = df_clean.applymap(_strip_val)
     return df_clean
 
-if uploaded_file is not None:
-    raw = uploaded_file.read()
-    # 1) prova come vero excel
-    df_excel = try_read_excel(raw)
-    if df_excel is not None:
-        # excel vero: pulisco e mostro solo colonne richieste
-        df_excel = clean_dataframe_strings(df_excel)
-        df_sel = select_required_columns(df_excel)
-        st.subheader("Anteprima (prime 19 righe) — colonne richieste")
-        st.dataframe(df_sel.head(19))
-        st.write(f"Dimensione dati (colonne richieste): {df_sel.shape[0]} righe × {df_sel.shape[1]} colonne")
-        st.download_button(
-            label="Scarica CSV (solo colonne richieste)",
-            data=df_sel.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_selezione_colonne.csv",
-            mime="text/csv",
-        )
-    else:
-        # file testuale: rileviamo automaticamente encoding/separatore (ma NON mostriamo campi per forzarli)
-        candidates = generate_encoding_candidates(raw, n_top=4)
-        detected_enc, _ = detect_with_chardet(raw)
-        top_enc = candidates[0]["encoding"] if candidates else (detected_enc or "utf-8")
-        snippet = candidates[0]["snippet"] if candidates else (raw.decode("latin1", errors="replace")[:1000])
-        guessed_sep = guess_separator_from_text(snippet)
 
-        # usiamo automaticamente rilevamento (nessun campo visibile per forzare)
-        enc_to_use = top_enc
-        sep_to_use = guessed_sep
+# ---------- read codes.csv (categorie -> codici) ----------
+def load_codes_file() -> dict:
+    """
+    Cerca codes.csv nella stessa cartella dello script (o nella cwd) e ritorna
+    un dizionario {Category: [codes...]}. Se non esiste, ritorna dizionario vuoto.
+    """
+    # prova path relativo allo script
+    base = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+    candidates = [base / "codes.csv", Path.cwd() / "codes.csv"]
+    for p in candidates:
+        if p.exists():
+            try:
+                codes_df = pd.read_csv(p)
+                # ci aspettiamo colonne Category,Codes
+                mapping = {}
+                for _, r in codes_df.iterrows():
+                    cat = str(r["Category"]).strip()
+                    codes_raw = str(r["Codes"]).strip() if not pd.isna(r["Codes"]) else ""
+                    # split by ; e rimuovi spazi
+                    codes = [c.strip() for c in codes_raw.split(";") if c.strip() != ""]
+                    mapping[cat] = codes
+                return mapping
+            except Exception:
+                return {}
+    return {}
 
-        try:
-            decoded_full = raw.decode(enc_to_use)
-        except Exception:
-            decoded_full = raw.decode(enc_to_use, errors="replace")
 
-        try:
-            df = robust_read_text_to_df(decoded_full, sep_to_use)
-            df = clean_dataframe_strings(df)
-            df_sel = select_required_columns(df)
-            st.subheader("Anteprima")
-            st.dataframe(df_sel.head(19))
-            st.write(f"Dimensione dati (colonne richieste): {df_sel.shape[0]} righe × {df_sel.shape[1]} colonne")
-            st.download_button(
-                label="Scarica CSV (solo colonne richieste)",
-                data=df_sel.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_selezione_colonne.csv",
-                mime="text/csv",
-            )
-        except Exception as e:
-            st.error("Impossibile convertire il file in tabella.")
-            st.write("Errore tecnico:", str(e))
+def build_normalized_code_map(codes_map: dict) -> dict:
+    """
+    Ritorna mapping_normalized_code -> [categories...]
+    Normalizzazione: rimuove caratteri non alphanum e uppercase.
+    Es F1/2 -> F12 (chiave normalizzata)
+    """
+    norm_map = {}
+    for cat, codes in codes_map.items():
+        for code in codes:
+            norm = re.sub(r'[^A-Za-z0-9]', '', code).upper()
+            if not norm:
+                continue
+            norm_map.setdefault(norm, []).append(cat)
+    return norm_map
+
+
+# ---------- funzione per estrarre codici dalla cella TurnoE ----------
+TOKEN_RE = re.compile(r"[A-Za-z0-9/\.]+")  # includiamo slash e punto nelle tokens originali
+
+
+def extract_matched_codes(cell_value: str, normalized_code_map: dict):
+    """
+    Dalla stringa cell_value estrae i token e mappa contro normalized_code_map.
+    Ritorna lista di (original_token, normalized_token, [categories...])
+    """
+    if not cell_value or str(cell_value).strip() == "":
+        return []
+    text = str(cell_value)
+    tokens = TOKEN_RE.findall(text)
+    matched = []
+    for tok in tokens:
+        norm = re.sub(r'[^A-Za-z0-9]', '', tok).upper()
+        if not norm:
+            continue
+        cats = normalized_code_map.get(norm)
+        if cats:
+            matched.append((tok.strip(), norm, cats))
+    return matched
+
+
+# ---------- UI e flusso principale ----------
+uploaded_file = st.file_uploader(
+    "Carica file (xls, xlsx, csv, txt - anche se ha estensione .xls)",
+    type=["xls", "xlsx", "csv", "txt"],
+)
+
+codes_map = load_codes_file()
+normalized_code_map = build_normalized_code_map(codes_map)
+
+# lista categorie da mostrare all'utente (solo quelle presenti nel file codes.csv)
+categories_available = sorted(list(codes_map.keys())) if codes_map else []
+
+if not categories_available:
+    st.warning("Attenzione: non è stato trovato 'codes.csv' nella repo. Le categorie non saranno disponibili.")
 else:
+    st.markdown("Seleziona le categorie di assenza da visualizzare:")
+    chosen_categories = st.multiselect("Categorie", options=categories_available, default=[])
+
+if uploaded_file is None:
     st.info("Carica un file per iniziare.")
+    st.stop()
+
+# read uploaded file into dataframe with previous robust logic
+raw = uploaded_file.read()
+df_excel = try_read_excel(raw)
+if df_excel is not None:
+    df = df_excel
+else:
+    candidates = generate_encoding_candidates(raw, n_top=4)
+    top_enc = candidates[0]["encoding"] if candidates else "utf-8"
+    snippet = candidates[0]["snippet"] if candidates else raw.decode("latin1", errors="replace")[:1000]
+    guessed_sep = guess_separator_from_text(snippet)
+    enc_to_use = top_enc
+    sep_to_use = guessed_sep
+    try:
+        decoded_full = raw.decode(enc_to_use)
+    except Exception:
+        decoded_full = raw.decode(enc_to_use, errors="replace")
+    df = robust_read_text_to_df(decoded_full, sep_to_use)
+
+# pulizia e selezione colonne richieste
+df = clean_dataframe_strings(df)
+df_sel = select_required_columns(df)
+
+# convert Data column to sortable value
+def sortable_date_value(v):
+    # prova int
+    try:
+        return int(str(v).strip())
+    except Exception:
+        pass
+    # prova format dd/mm/yyyy o yyyy-mm-dd
+    try:
+        dt = pd.to_datetime(v, dayfirst=True, errors="coerce")
+        if pd.isna(dt):
+            return str(v)
+        return dt
+    except Exception:
+        return str(v)
+
+df_sel["_sort_data"] = df_sel["Data"].apply(sortable_date_value)
+
+# Se l'utente non ha selezionato categorie, mostriamo anteprima delle colonne richieste ma non dettagli delle assenze
+if not categories_available:
+    st.subheader("Anteprima (prime 19 righe) — colonne richieste")
+    st.dataframe(df_sel.head(19))
+    st.write("Impossibile proseguire con l'analisi delle categorie: manca codes.csv.")
+    st.stop()
+
+st.subheader("Anteprima (prime 19 righe) — colonne richieste")
+st.dataframe(df_sel.head(19))
+
+if not chosen_categories:
+    st.info("Seleziona una o più categorie nella casella 'Categorie' per vedere i dettagli per dipendente.")
+    st.stop()
+
+# Costruisco l'insieme dei codici normalizzati appartenenti alle categorie selezionate
+selected_norm_codes = set()
+for cat in chosen_categories:
+    for code in codes_map.get(cat, []):
+        norm = re.sub(r'[^A-Za-z0-9]', '', code).upper()
+        if norm:
+            selected_norm_codes.add(norm)
+
+# per ogni riga estraiamo matched codes e filtriamo
+rows = []
+for _, r in df_sel.iterrows():
+    turno_cell = r.get("TurnoE", "")
+    matched = extract_matched_codes(turno_cell, normalized_code_map)
+    # matched è lista di tuples (original_token, norm, [cats...])
+    # consideriamo match se uno dei norm appartiene a selected_norm_codes
+    matched_selected = [m for m in matched if m[1] in selected_norm_codes]
+    if matched_selected:
+        # prendiamo il primo matched_selected (manteniamo ordine delle tokens)
+        # ma è possibile avere più codici, in tal caso mostriamo tutti separati da spazio
+        matched_tokens = [m[0] for m in matched_selected]
+        rows.append({
+            "Matricola": r.get("Matricola", ""),
+            "Cognome": r.get("Cognome", ""),
+            "Nome": r.get("Nome", ""),
+            "Data": r.get("Data", ""),
+            "giorno": r.get("giorno", ""),
+            "TurnoE_matched": " ".join(matched_tokens),
+            "_sort_data": r.get("_sort_data")
+        })
+
+if not rows:
+    st.write("Nessuna occorrenza trovata per le categorie selezionate.")
+    st.stop()
+
+result_df = pd.DataFrame(rows)
+
+# ordiniamo per matricola (numerica se possibile) e data crescente
+def matricola_sort_key(v):
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return str(v).zfill(10)
+
+result_df["_mat_sort"] = result_df["Matricola"].apply(matricola_sort_key)
+result_df = result_df.sort_values(by=["_mat_sort", "_sort_data"])
+
+# raggruppiamo per Matricola e stampiamo per ogni persona l'elenco ordinato di giorni
+st.header("Risultato — per dipendente")
+last_mat = None
+for mat, group in result_df.groupby("Matricola", sort=False):
+    # get first row for name
+    first = group.iloc[0]
+    cogn = first.get("Cognome", "")
+    nom = first.get("Nome", "")
+    st.subheader(f"{mat}  {cogn} {nom}")
+    # ordina il gruppo per _sort_data asc
+    grp_sorted = group.sort_values("_sort_data")
+    # stampa righe
+    for _, row in grp_sorted.iterrows():
+        giorno = str(row.get("giorno", "")).strip()
+        data_val = row.get("Data", "")
+        turno_code = row.get("TurnoE_matched", "")
+        # rendo la riga compatta come "Giorno Data CODICE"
+        st.text(f"{giorno} {data_val} {turno_code}")
+
+# scarica risultato complessivo come CSV
+csv_bytes = result_df.drop(columns=["_mat_sort", "_sort_data"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
+st.download_button("Scarica risultato (tutte le occorrenze trovate)", csv_bytes, file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_assenze_selezionate.csv", mime="text/csv")
