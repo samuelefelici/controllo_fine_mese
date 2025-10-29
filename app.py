@@ -9,11 +9,15 @@ st.set_page_config(page_title="Controllo Paghe", layout="wide")
 st.title("Controllo Paghe")
 
 st.markdown(
-    "Carica il file. Se l'anteprima appare in cinese significa che l'encoding usato è sbagliato: "
-    "qui sotto vengono provate più decodifiche e puoi scegliere quella corretta."
+    "Carica il file. L'app rileva il formato/encoding e mostra in anteprima SOLO le colonne richieste: "
+    "Matricola, Cognome, Nome, Data, (colonna vuota dopo Data -> rinominata 'giorno'), TurnoE. "
+    "Se la colonna dopo Data non ha intestazione la chiameremo 'giorno'."
 )
 
-uploaded_file = st.file_uploader("Carica file (xls, xlsx, csv, txt - anche se ha estensione .xls)", type=["xls", "xlsx", "csv", "txt"])
+uploaded_file = st.file_uploader(
+    "Carica file (xls, xlsx, csv, txt - anche se ha estensione .xls)",
+    type=["xls", "xlsx", "csv", "txt"],
+)
 
 # parole chiave italiane attese per aiutare il riconoscimento
 KEYWORDS = ["Residenza", "Matricola", "Cognome", "Nome", "Gruppo", "Data", "Turno", "Inizio", "Fine"]
@@ -32,7 +36,6 @@ ENC_CANDIDATES = [
 
 def try_read_excel(raw_bytes):
     try:
-        # prova con pandas.read_excel (per .xls/.xlsx veri)
         sheets = pd.read_excel(BytesIO(raw_bytes), sheet_name=None, engine=None)
         if isinstance(sheets, dict):
             first = list(sheets.keys())[0]
@@ -44,10 +47,8 @@ def try_read_excel(raw_bytes):
 def score_decoded_text(text: str) -> int:
     t = text.lower()
     score = 0
-    # conta occorrenze delle parole chiave
     for kw in KEYWORDS:
         score += t.count(kw.lower())
-    # penalizza caratteri di replacement o troppi caratteri non-ASCII di controllo
     score -= text.count("�") * 5
     return score
 
@@ -70,7 +71,7 @@ def generate_encoding_candidates(raw_bytes: bytes, n_top=6):
             candidates.insert(0, detected_enc)
 
     scored = []
-    sample_bytes = raw_bytes[:8000]  # campione
+    sample_bytes = raw_bytes[:8000]
     for enc in candidates:
         try:
             decoded = sample_bytes.decode(enc)
@@ -106,12 +107,6 @@ def guess_separator_from_text(text: str):
     return sep
 
 def parse_rows_with_sep(decoded_text: str, sep_choice: str):
-    """
-    Restituisce una lista di righe (lista di campi) a seconda del separatore scelto.
-    - se sep_choice è '\\t' o '\t' => usa csv.reader con delimiter tab
-    - se sep_choice è '\\s+' => usa re.split(r'\s+')
-    - altrimenti usa csv.reader con il delimiter fornito
-    """
     lines = [ln for ln in decoded_text.splitlines() if ln.strip() != ""]
     if not lines:
         return []
@@ -123,7 +118,6 @@ def parse_rows_with_sep(decoded_text: str, sep_choice: str):
     elif sep_choice == r"\s+":
         rows = [re.split(r'\s+', line.strip()) for line in lines]
     else:
-        # usa il carattere passato (es. ';' o ',')
         delimiter = sep_choice
         reader = csv.reader(lines, delimiter=delimiter)
         rows = [row for row in reader]
@@ -131,12 +125,6 @@ def parse_rows_with_sep(decoded_text: str, sep_choice: str):
     return rows
 
 def robust_rows_to_df(rows):
-    """
-    Trasforma rows (lista di liste) in DataFrame:
-    - la prima riga è l'intestazione
-    - se righe successive hanno più campi dell'intestazione, unisce i campi extra nell'ultimo campo
-    - se righe hanno meno campi, le completa con stringhe vuote
-    """
     if not rows:
         return pd.DataFrame()
 
@@ -144,15 +132,12 @@ def robust_rows_to_df(rows):
     hdr_len = len(header)
     processed = []
     for row in rows[1:]:
-        # se riga vuota skip
         if all((cell is None or str(cell).strip() == "") for cell in row):
             continue
         if len(row) < hdr_len:
             row = row + [""] * (hdr_len - len(row))
         elif len(row) > hdr_len:
-            # unisci tutti i campi eccedenti nel campo finale
             row = row[:hdr_len-1] + [" ".join([str(x).strip() for x in row[hdr_len-1:]])]
-        # assicurati della lunghezza
         if len(row) != hdr_len:
             row = (row + [""] * hdr_len)[:hdr_len]
         processed.append([str(x).strip() for x in row])
@@ -166,15 +151,92 @@ def robust_read_text_to_df(decoded_text: str, sep_choice: str):
     df = robust_rows_to_df(rows)
     return df
 
+def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Seleziona e ritorna un DataFrame contenente solo queste colonne, rinominate come indicato:
+    Matricola, Cognome, Nome, Data, giorno, TurnoE
+    - 'giorno' è la colonna che si trova immediatamente dopo la colonna 'Data'; se non esiste,
+      cerchiamo una colonna vuota o con nome 'Giorno'. Se comunque non si trova, viene creata vuota.
+    - Se una delle colonne richieste non esiste, viene aggiunta come colonna vuota.
+    """
+    df2 = df.copy()
+    # Normalizza nomi colonne
+    cols = [str(c).strip() if c is not None else "" for c in df2.columns]
+    df2.columns = cols
+
+    # trova indice della colonna 'Data' (case-insensitive)
+    idx_data = next((i for i, c in enumerate(cols) if c.lower() == "data"), None)
+
+    giorno_source = None
+    if idx_data is not None and idx_data + 1 < len(cols):
+        # colonna subito dopo 'Data'
+        giorno_source = cols[idx_data + 1]
+
+    # se non trovata, cerca colonna vuota o colonna 'Giorno'
+    if not giorno_source:
+        empty_col = next((c for c in cols if c == ""), None)
+        if empty_col:
+            giorno_source = empty_col
+        else:
+            daycol = next((c for c in cols if c.lower() == "giorno"), None)
+            if daycol:
+                giorno_source = daycol
+
+    # trova colonne esistenti (case-insensitive search)
+    def find_col(ci_name):
+        return next((c for c in cols if c.lower() == ci_name.lower()), None)
+
+    matricola_col = find_col("Matricola")
+    cognome_col = find_col("Cognome")
+    nome_col = find_col("Nome")
+    data_col = find_col("Data")
+    turnoe_col = find_col("TurnoE") or find_col("Turno E") or find_col("turno_e")
+
+    # Costruisci DataFrame risultato con le intestazioni desiderate
+    result = pd.DataFrame()
+    result["Matricola"] = df2[matricola_col] if matricola_col else ""
+    result["Cognome"] = df2[cognome_col] if cognome_col else ""
+    result["Nome"] = df2[nome_col] if nome_col else ""
+    result["Data"] = df2[data_col] if data_col else ""
+    if giorno_source and giorno_source in df2.columns:
+        result["giorno"] = df2[giorno_source]
+    else:
+        # crea colonna vuota se non trovata
+        result["giorno"] = ""
+    result["TurnoE"] = df2[turnoe_col] if turnoe_col else ""
+
+    # Garantiamo l'ordine corretto e ritornamo
+    return result[["Matricola", "Cognome", "Nome", "Data", "giorno", "TurnoE"]]
+
+def clean_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
+    df_clean = df.copy()
+    df_clean.columns = [c.strip() if isinstance(c, str) else c for c in df_clean.columns]
+    def _strip_val(x):
+        return x.strip() if isinstance(x, str) else x
+    # applymap può essere costoso su grandi file, ma qui ci serve per pulire spazi
+    df_clean = df_clean.applymap(_strip_val)
+    return df_clean
+
 if uploaded_file is not None:
     raw = uploaded_file.read()
     # 1) prova come vero excel
     df_excel, info = try_read_excel(raw)
     if df_excel is not None:
         st.success(f"File letto come {info}")
-        st.subheader("Anteprima (prime 19 righe)")
-        st.dataframe(df_excel.head(19))
+        # pulizia di base e selezione colonne richieste
+        df_excel = clean_dataframe_strings(df_excel)
+        df_sel = select_required_columns(df_excel)
+        st.subheader("Anteprima (prime 19 righe) — colonne richieste")
+        st.dataframe(df_sel.head(19))
+        st.write(f"Dimensione dati (colonne richieste): {df_sel.shape[0]} righe × {df_sel.shape[1]} colonne")
+        st.download_button(
+            label="Scarica CSV (solo colonne richieste)",
+            data=df_sel.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_selezione_colonne.csv",
+            mime="text/csv",
+        )
     else:
+        # 2) file testuale: genera candidati encodings
         st.info("File riconosciuto come testo. Provo diverse decodifiche...")
         candidates = generate_encoding_candidates(raw, n_top=8)
         detected_enc, detected_conf = detect_with_chardet(raw)
@@ -193,7 +255,7 @@ if uploaded_file is not None:
             sel_idx = st.radio(
                 "Decodifiche trovate (anteprima snippet):",
                 options=list(range(len(labels))),
-                format_func=lambda i: labels[i]
+                format_func=lambda i: labels[i],
             )
             chosen = enc_options[sel_idx][1]
             st.markdown(f"**Encoding suggerito:** {chosen['encoding']}  — punteggio: {chosen['score']}")
@@ -221,7 +283,10 @@ if uploaded_file is not None:
             enc_to_use = "utf-8"
         st.write(f"Encoding selezionato per il parsing: {enc_to_use}")
 
-        manual_sep = st.text_input("Forza separatore (es. '\\t' o ';' o ',' o '\\\\s+' per whitespace)", value=(guessed_sep if guessed_sep else "\\s+"))
+        manual_sep = st.text_input(
+            "Forza separatore (es. '\\t' o ';' o ',' o '\\\\s+' per whitespace)",
+            value=(guessed_sep if guessed_sep else "\\s+"),
+        )
         st.write(f"Separatore usato per il parsing: {manual_sep}")
 
         try:
@@ -230,24 +295,19 @@ if uploaded_file is not None:
             decoded_full = raw.decode(enc_to_use, errors="replace")
 
         try:
-            # usa il nuovo parser robusto
+            # usa il parser robusto per generare DataFrame
             df = robust_read_text_to_df(decoded_full, manual_sep)
             st.success("Lettura testo -> DataFrame avvenuta con successo (parser robusto)")
-            st.subheader("Anteprima (prime 19 righe)")
-            st.dataframe(df.head(19))
-            def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-                df_clean = df.copy()
-                df_clean.columns = [c.strip() if isinstance(c, str) else c for c in df_clean.columns]
-                def _strip_val(x):
-                    return x.strip() if isinstance(x, str) else x
-                df_clean = df_clean.applymap(_strip_val)
-                return df_clean
-            df_clean = clean_dataframe(df)
-            st.write(f"Dimensione dati: {df_clean.shape[0]} righe × {df_clean.shape[1]} colonne")
+            df = clean_dataframe_strings(df)
+            # seleziona solo le colonne richieste
+            df_sel = select_required_columns(df)
+            st.subheader("Anteprima (prime 19 righe) — colonne richieste")
+            st.dataframe(df_sel.head(19))
+            st.write(f"Dimensione dati (colonne richieste): {df_sel.shape[0]} righe × {df_sel.shape[1]} colonne")
             st.download_button(
-                label="Scarica CSV pulito",
-                data=df_clean.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_pulito.csv",
+                label="Scarica CSV (solo colonne richieste)",
+                data=df_sel.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_selezione_colonne.csv",
                 mime="text/csv",
             )
         except Exception as e:
