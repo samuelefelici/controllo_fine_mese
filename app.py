@@ -10,6 +10,14 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 
+try:
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    HAS_REPORTLAB = True
+except Exception:
+    HAS_REPORTLAB = False
+
 st.set_page_config(page_title="Controllo Paghe", layout="wide")
 st.title("Controllo Paghe")
 
