@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 from io import BytesIO, StringIO
@@ -350,11 +349,11 @@ uploaded_file = st.file_uploader(
     type=["xls", "xlsx", "csv", "txt"],
 )
 
+# If codes loader functions are not present in the current namespace (they are above),
+# use them; otherwise attempt to load codes.csv locally.
 codes_map = load_codes_file() if 'load_codes_file' in globals() else {}
-# if previous helper functions defined elsewhere, ensure they exist; otherwise re-define minimal loaders:
 if not codes_map:
-    # try loading using local function defined earlier in conversation scope
-    from pathlib import Path
+    # fallback loader (same logic as load_codes_file)
     def load_codes_file_local():
         base = Path(__file__).parent if "__file__" in globals() else Path.cwd()
         p = base / "codes.csv"
@@ -394,6 +393,9 @@ if uploaded_file is None:
     st.info("Carica un file per iniziare.")
     st.stop()
 
+# Show the upload confirmation message (user requested exact text)
+st.success("File caricato correttametne")
+
 # lettura file (excel o testo) - detection automatica
 raw = uploaded_file.read()
 df_excel = try_read_excel(raw)
@@ -431,8 +433,7 @@ def sortable_date_value(v):
 
 df_sel["_sort_data"] = df_sel["Data"].apply(sortable_date_value)
 
-st.subheader("Anteprima (prime 19 righe) — colonne richieste")
-st.dataframe(df_sel.head(19))
+# NOTE: preview removed per user request
 
 if not categories_available:
     st.stop()
@@ -495,7 +496,8 @@ if st.button("Elabora"):
     try:
         pdf_bytes = generate_pdf_for_categories_table(category_results, mese_scelto, anno_input)
         fname = f"{uploaded_file.name.rsplit('.',1)[0]}_{mese_scelto}_{anno_input}_assenze.pdf"
-        st.success("PDF generato correttamente.")
+        # user requested exact processed message
+        st.success("File ebalorato correttamente")
         st.download_button("Scarica PDF", data=pdf_bytes, file_name=fname, mime="application/pdf")
     except Exception as e:
         st.error(f"Errore nella generazione del PDF: {e}")
