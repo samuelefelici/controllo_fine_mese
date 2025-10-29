@@ -6,13 +6,13 @@ import csv
 import chardet
 import re
 from pathlib import Path
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
 
+# reportlab import guard (mostro snippet come richiesto)
 try:
-    from reportlab.pdfgen import canvas
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, KeepTogether
     from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib.units import mm
     HAS_REPORTLAB = True
 except Exception:
@@ -255,76 +255,93 @@ def extract_matched_codes(cell_value: str, normalized_code_map: dict):
     return matched
 
 
-# -------------------- PDF generation --------------------
-def generate_pdf_for_categories(category_results: dict, month_name: str, year: str) -> bytes:
+# -------------------- PDF generation (tabellare per conducente) --------------------
+def generate_pdf_for_categories_table(category_results: dict, month_name: str, year: str) -> bytes:
     """
     category_results: dict category -> DataFrame (with columns Matricola,Cognome,Nome,Data,giorno,TurnoE_matched,_sort_data)
-    Restituisce PDF bytes in memoria con struttura:
-    [Header Category Month Year]
-    [Per each driver: title Matricola Cognome Nome]
-    [li: giorno Data CODE]
+    Produce un PDF dove per ogni categoria c'è un blocco: titolo e poi per ogni conducente una tabella
+    | Matricola Nome |
+    | Data | Giorno | Assenza |
+    | ... rows ... |
     """
     buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-    margin = 20 * mm
-    y = height - margin
-    line_height = 5.5 * mm
-    title_space = 9 * mm
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            leftMargin=15*mm, rightMargin=15*mm, topMargin=15*mm, bottomMargin=15*mm)
+    styles = getSampleStyleSheet()
+    style_title = styles["Heading2"]
+    style_cat = styles["Heading3"]
+    style_normal = styles["Normal"]
 
-    def new_page():
-        nonlocal y
-        c.showPage()
-        y = height - margin
+    elements = []
 
     for cat, df_cat in category_results.items():
-        # Header for category
-        title_text = f"{cat}  {month_name} {year}"
-        c.setFont("Helvetica-Bold", 14)
-        if y < margin + title_space:
-            new_page()
-        c.drawString(margin, y, title_text)
-        y -= title_space
+        # category header
+        elements.append(Paragraph(f"{cat} — {month_name} {year}", style_cat))
+        elements.append(Spacer(1, 4))
 
-        # group by matricola
         if df_cat.empty:
-            c.setFont("Helvetica-Oblique", 10)
-            if y < margin + line_height:
-                new_page()
-            c.drawString(margin + 5 * mm, y, "Nessuna occorrenza trovata per questa categoria.")
-            y -= line_height
+            elements.append(Paragraph("Nessuna occorrenza trovata per questa categoria.", style_normal))
+            elements.append(PageBreak())
             continue
 
+        # group by matricola
         for mat, group in df_cat.groupby("Matricola", sort=False):
             first = group.iloc[0]
             cogn = first.get("Cognome", "")
             nom = first.get("Nome", "")
-            header_line = f"{mat}  {cogn} {nom}"
-            c.setFont("Helvetica-Bold", 11)
-            if y < margin + line_height * 4:
-                new_page()
-            c.drawString(margin + 3 * mm, y, header_line)
-            y -= line_height
-
+            # table data: first a single-cell row with matricola + name (we'll style it)
+            header_cell = f"{mat}   {cogn} {nom}"
+            # table body: header row then data rows
+            table_data = []
+            table_data.append([header_cell])  # single cell header (span later)
+            table_data.append(["Data", "Giorno", "Assenza"])
             grp_sorted = group.sort_values("_sort_data")
-            c.setFont("Helvetica", 10)
             for _, row in grp_sorted.iterrows():
+                data_val = str(row.get("Data", "")).strip()
                 giorno = str(row.get("giorno", "")).strip()
-                data_val = row.get("Data", "")
-                turno_code = row.get("TurnoE_matched", "")
-                line_text = f"{giorno} {data_val} {turno_code}".strip()
-                if y < margin + line_height:
-                    new_page()
-                c.drawString(margin + 10 * mm, y, line_text)
-                y -= line_height
+                turno_code = str(row.get("TurnoE_matched", "")).strip()
+                table_data.append([data_val, giorno, turno_code])
 
-            # post-driver spacing
-            y -= 1.5 * mm
+            # create table: first row 1 column, subsequent rows 3 columns -> normalize by expanding first row with colspan
+            # We'll build a table with maximum 3 columns; for the first row, set colspan to 3 by duplicating the value
+            tbl_rows = []
+            for i, r in enumerate(table_data):
+                if i == 0:
+                    tbl_rows.append([r[0], "", ""])
+                else:
+                    # ensure row length is 3
+                    if len(r) == 1:
+                        tbl_rows.append([r[0], "", ""])
+                    elif len(r) == 3:
+                        tbl_rows.append(r)
+                    else:
+                        # pad/truncate
+                        row3 = (r + ["", "", ""])[:3]
+                        tbl_rows.append(row3)
 
-        # after each category add a page break (start next category on new page)
-        new_page()
+            tbl = Table(tbl_rows, colWidths=[45*mm, 35*mm, 90*mm])
+            # style
+            tbl_style = TableStyle([
+                ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+                ('SPAN', (0,0), (-1,0)),  # first row spans all columns
+                ('BACKGROUND', (0,1), (-1,1), colors.lightgrey),  # header row background
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                ('ALIGN', (0,1), (-1,1), 'CENTER'),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('LEFTPADDING', (0,0), (-1,-1), 4),
+                ('RIGHTPADDING', (0,0), (-1,-1), 4),
+                ('FONTSIZE', (0,0), (-1,-1), 9),
+            ])
+            tbl.setStyle(tbl_style)
 
-    c.save()
+            # keep together the table for readability
+            elements.append(KeepTogether(tbl))
+            elements.append(Spacer(1, 4))
+
+        # page break after category
+        elements.append(PageBreak())
+
+    doc.build(elements)
     buffer.seek(0)
     return buffer.read()
 
@@ -335,8 +352,30 @@ uploaded_file = st.file_uploader(
     type=["xls", "xlsx", "csv", "txt"],
 )
 
-codes_map = load_codes_file()
-normalized_code_map = build_normalized_code_map(codes_map)
+codes_map = load_codes_file() if 'load_codes_file' in globals() else {}
+# if previous helper functions defined elsewhere, ensure they exist; otherwise re-define minimal loaders:
+if not codes_map:
+    # try loading using local function defined earlier in conversation scope
+    from pathlib import Path
+    def load_codes_file_local():
+        base = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+        p = base / "codes.csv"
+        if p.exists():
+            try:
+                df = pd.read_csv(p)
+                mapping = {}
+                for _, r in df.iterrows():
+                    cat = str(r["Category"]).strip()
+                    codes_raw = str(r["Codes"]).strip() if not pd.isna(r["Codes"]) else ""
+                    codes = [c.strip() for c in codes_raw.split(";") if c.strip() != ""]
+                    mapping[cat] = codes
+                return mapping
+            except Exception:
+                return {}
+        return {}
+    codes_map = load_codes_file_local()
+
+normalized_code_map = build_normalized_code_map(codes_map) if 'build_normalized_code_map' in globals() else {}
 categories_available = sorted(list(codes_map.keys())) if codes_map else []
 
 if not categories_available:
@@ -350,14 +389,14 @@ mesi = [
     "Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
     "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"
 ]
-mese_scelto = st.selectbox("Mese", options=mesi, index=9)  # default Ottobre (index 9) - puoi cambiare
+mese_scelto = st.selectbox("Mese", options=mesi, index=0)
 anno_input = st.text_input("Anno", value=str(pd.Timestamp.now().year))
 
 if uploaded_file is None:
     st.info("Carica un file per iniziare.")
     st.stop()
 
-# lettura file (excel o testo) - detection automatica, senza mostrare candidate all'utente
+# lettura file (excel o testo) - detection automatica
 raw = uploaded_file.read()
 df_excel = try_read_excel(raw)
 if df_excel is not None:
@@ -404,9 +443,15 @@ if not chosen_categories:
     st.info("Seleziona una o più categorie per poter generare il PDF.")
     st.stop()
 
+# se manca reportlab, segnalo e interrompo la generazione PDF ma lascio il resto funzionare
+if not HAS_REPORTLAB:
+    st.error(
+        "La libreria 'reportlab' non è assente nell'ambiente. Per generare il PDF aggiungi 'reportlab>=3.6.12' a requirements.txt e riavvia l'app (o esegui 'pip install reportlab')."
+    )
+    st.stop()
+
 # bottone Elabora
 if st.button("Elabora"):
-    # per ogni categoria selezionata produciamo il dataframe result_df (come prima) e lo memorizziamo in dict
     category_results = {}
     for cat in chosen_categories:
         selected_norm_codes = set()
@@ -433,7 +478,6 @@ if st.button("Elabora"):
                 })
 
         if not rows:
-            # salva empty DF per categoria (gestito in PDF)
             category_results[cat] = pd.DataFrame(columns=["Matricola", "Cognome", "Nome", "Data", "giorno", "TurnoE_matched", "_sort_data"])
             continue
 
@@ -449,9 +493,9 @@ if st.button("Elabora"):
         result_df = result_df.sort_values(by=["_mat_sort", "_sort_data"])
         category_results[cat] = result_df
 
-    # Genera PDF in memoria
+    # Genera PDF tabellare per categoria
     try:
-        pdf_bytes = generate_pdf_for_categories(category_results, mese_scelto, anno_input)
+        pdf_bytes = generate_pdf_for_categories_table(category_results, mese_scelto, anno_input)
         fname = f"{uploaded_file.name.rsplit('.',1)[0]}_{mese_scelto}_{anno_input}_assenze.pdf"
         st.success("PDF generato correttamente.")
         st.download_button("Scarica PDF", data=pdf_bytes, file_name=fname, mime="application/pdf")
