@@ -170,11 +170,25 @@ def robust_read_text_to_df(decoded_text: str, sep_choice: str):
 
 
 def clean_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ritorna una copia del DataFrame in cui:
+    - i nomi delle colonne stringa sono strip() (rimossi spazi ai bordi)
+    - nelle colonne testuali, ogni valore stringa viene strip() (spazi ai bordi rimossi)
+
+    Nota: evitiamo applymap perché può non essere disponibile in alcune versioni di pandas,
+    e perché la versione vettorizzata con .str.strip() è più efficiente.
+    """
     df_clean = df.copy()
+
+    # 1) Pulisci i nomi delle colonne (solo se sono stringhe)
     df_clean.columns = [c.strip() if isinstance(c, str) else c for c in df_clean.columns]
-    def _strip_val(x):
-        return x.strip() if isinstance(x, str) else x
-    df_clean = df_clean.applymap(_strip_val)
+
+    # 2) Pulisci i valori: applica strip SOLO alle colonne "testuali"
+    text_columns = df_clean.select_dtypes(include=["object", "string"]).columns
+    for col_name in text_columns:
+        # .astype("string") rende la colonna gestibile con .str, mantenendo i missing values
+        df_clean[col_name] = df_clean[col_name].astype("string").str.strip()
+
     return df_clean
 
 
